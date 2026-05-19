@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/docker_exec.sh"
+
+BT_STATE_FILE="/tmp/rpi-bt-state"
+
+# Device class codes (3-byte hex, no prefix)
+declare -A BT_CLASSES=(
+    [phone]="200404"
+    [computer]="100104"
+    [audio]="200418"
+    [none]=""
+)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+_bt_check_state() {
+    [[ -f "$BT_STATE_FILE" ]] || die "Bluetooth emulation not running. Run: rpi-bluetooth start"
+}
+
+_get_hci_list() {
+    hciconfig 2>/dev/null | awk '/^hci[0-9]+:/ {print substr($1,1,length($1)-1)}' | sort -V
+}
+
+_next_free_hci() {
+    local before=("$@")
+    local after
+    mapfile -t after < <(_get_hci_list)
+    for h in "${after[@]}"; do
+        if ! printf '%s\n' "${before[@]}" | grep -qx "$h"; then
+            echo "$h"
+            return
+        fi
+    done
+    echo ""
+}
+
+_gen_bt_addr() {
+    local idx="$1"
+    printf "AA:BB:CC:DD:EE:%02X" "$idx"
+}
+
+# ── cmd: start ────────────────────────────────────────────────────────────────
+
+cmd_bt_start() {
+    [[ -f "$BT_STATE_FILE" ]] && die "Bluetooth emulation already running. Run: rpi-bluetooth stop first."
+    command -v hciconfig &>/dev/null || die "hciconfig not found (install bluez)"
+    sudo -n true 2>/dev/null || die "sudo access required (run: sudo -v)"
+
+    # ── wizard ────────────────────────────────────────────────────────────────
+    echo ""
+    echo "=== Bluetooth Emulation Setup ==="
+    echo ""
+    read -rp "Number of fake BT devices [1-5, default 1]: " n_input
+    local N="${n_input:-1}"
+    [[ "$N" =~ ^[1-5]$ ]] || die "Choose 1-5"
+
+    local NAMES=() ADDRS=() CLASSES=()
+    for ((i=0; i<N; i++)); do
+        echo ""
+        echo "--- Device $((i+1)) of $N ---"
+        read -rp "  Name: " dname
+        [[ -n "$dname" ]] || die "Device name cannot be empty"
+
+        local default_addr; default_addr=$(_gen_bt_addr $((i+1)))
+        read -rp "  BD Address [default: $default_addr]: " addr_input
+        local addr="${addr_input:-$default_addr}"
+        # Validate address format
+        [[ "$addr" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || \
+            die "Invalid BD address format (use XX:XX:XX:XX:XX:XX)"
+
+        echo "  Class: [1] Phone  [2] Computer  [3] Audio/Headset  [4] None"
+        read -rp "  Class [1-4, default 1]: " class_input
+        local class_key
+        case "${class_input:-1}" in
+            1) class_key="phone" ;;
+            2) class_key="computer" ;;
+            3) class_key="audio" ;;
+            4) class_key="none" ;;
+            *) die "Invalid class (choose 1-4)" ;;
+        esac
+
+        NAMES+=("$dname")
+        ADDRS+=("$addr")
+        CLASSES+=("$class_key")
+    done
+
+    # ── load hci_vhci ─────────────────────────────────────────────────────────
+    section "Loading virtual Bluetooth hardware"
+
+    local MODULE_LOADED_BY_US=0
+    if ! lsmod | grep -q '^hci_vhci'; then
+        sudo modprobe hci_vhci
+        MODULE_LOADED_BY_US=1
+        info "Loaded hci_vhci"
+    else
+        info "hci_vhci already loaded"
+    fi
+
+    [[ -c /dev/vhci ]] || die "/dev/vhci not found after loading hci_vhci"
+
+    # ── initialise state file ─────────────────────────────────────────────────
+    cat > "$BT_STATE_FILE" <<EOF
+MODULE_LOADED_BY_US=$MODULE_LOADED_BY_US
+DEVICE_COUNT=$N
+EOF
+
+    # ── create virtual HCI per device ─────────────────────────────────────────
+    section "Creating virtual Bluetooth adapters"
+
+    for ((i=0; i<N; i++)); do
+        local dname="${NAMES[$i]}"
+        local addr="${ADDRS[$i]}"
+        local class_key="${CLASSES[$i]}"
+
+        # Record HCI list before opening /dev/vhci
+        local hci_before=()
+        mapfile -t hci_before < <(_get_hci_list)
+
+        # Open /dev/vhci in a background process — kernel creates a new hciN per open fd
+        bash -c "exec 3<>/dev/vhci; while [[ -f '$BT_STATE_FILE' ]]; do sleep 2; done" &
+        local vhci_pid=$!
+
+        # Wait for kernel to register the new hciN
+        local tries=0
+        local new_hci=""
+        while [[ -z "$new_hci" && $tries -lt 20 ]]; do
+            sleep 0.3
+            new_hci=$(_next_free_hci "${hci_before[@]}")
+            ((tries++))
+        done
+
+        if [[ -z "$new_hci" ]]; then
+            kill "$vhci_pid" 2>/dev/null || true
+            die "Timed out waiting for virtual HCI device to appear"
+        fi
+
+        # Bring up the adapter
+        sudo hciconfig "$new_hci" up 2>/dev/null || {
+            info "WARNING: hciconfig $new_hci up failed — adapter may need btattach"
+        }
+
+        # Set fake BD address via btmgmt (best-effort; not all virtual adapters support it)
+        local hci_idx="${new_hci#hci}"
+        sudo btmgmt --index "$hci_idx" public-addr "$addr" 2>/dev/null || true
+
+        # Re-up after address change
+        sudo hciconfig "$new_hci" up 2>/dev/null || true
+
+        # Set device name and class
+        sudo hciconfig "$new_hci" name "$dname" 2>/dev/null || true
+        local class_hex="${BT_CLASSES[$class_key]:-}"
+        [[ -n "$class_hex" ]] && sudo hciconfig "$new_hci" class "0x$class_hex" 2>/dev/null || true
+
+        # Make discoverable and connectable
+        sudo hciconfig "$new_hci" piscan 2>/dev/null || true
+
+        info "Device $((i+1)): $new_hci  name=\"$dname\"  addr=$addr  class=$class_key  (vhci pid $vhci_pid)"
+
+        cat >> "$BT_STATE_FILE" <<EOF
+DEVICE_${i}_NAME=$dname
+DEVICE_${i}_ADDR=$addr
+DEVICE_${i}_CLASS=$class_key
+DEVICE_${i}_HCI=$new_hci
+DEVICE_${i}_VHCI_PID=$vhci_pid
+EOF
+    done
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    echo ""
+    echo "=== Bluetooth Emulation Active ==="
+    for ((i=0; i<N; i++)); do
+        local hci_var="DEVICE_${i}_HCI"
+        printf "  %-6s  name: %-20s  addr: %s  class: %s\n" \
+            "${!hci_var}" "${NAMES[$i]}" "${ADDRS[$i]}" "${CLASSES[$i]}"
+    done
+    echo ""
+    info "Pi chroot (rpi-bluetooth exec/shell) sees these adapters via --network host."
+    info "Run: rpi-bluetooth exec [image] hcitool scan"
+    info "Run: rpi-bluetooth stop   to tear down"
+    echo ""
+}
+
+# ── cmd: stop ─────────────────────────────────────────────────────────────────
+
+cmd_bt_stop() {
+    if [[ ! -f "$BT_STATE_FILE" ]]; then
+        info "No active Bluetooth emulation."
+        return 0
+    fi
+
+    section "Stopping Bluetooth emulation"
+
+    local MODULE_LOADED_BY_US=0 DEVICE_COUNT=0
+    source "$BT_STATE_FILE"
+
+    # Bring down virtual adapters and kill vhci holder processes
+    for ((i=0; i<DEVICE_COUNT; i++)); do
+        local hci_var="DEVICE_${i}_HCI"
+        local pid_var="DEVICE_${i}_VHCI_PID"
+        local hci="${!hci_var:-}"
+        local vpid="${!pid_var:-}"
+
+        [[ -n "$hci" ]] && sudo hciconfig "$hci" down 2>/dev/null || true
+        [[ -n "$vpid" ]] && kill "$vpid" 2>/dev/null || true
+    done
+
+    # Give kernel time to remove virtual hciN devices after fd close
+    sleep 0.8
+
+    if [[ "$MODULE_LOADED_BY_US" == "1" ]]; then
+        info "Unloading hci_vhci..."
+        sudo modprobe -r hci_vhci 2>/dev/null || \
+            info "WARNING: could not unload hci_vhci"
+    else
+        info "(hci_vhci was pre-existing — skipping unload)"
+    fi
+
+    rm -f "$BT_STATE_FILE"
+    info "Bluetooth emulation stopped."
+    echo ""
+}
+
+# ── cmd: list ─────────────────────────────────────────────────────────────────
+
+cmd_bt_list() {
+    if [[ ! -f "$BT_STATE_FILE" ]]; then
+        info "No active Bluetooth emulation."
+        return 0
+    fi
+
+    local DEVICE_COUNT=0
+    source "$BT_STATE_FILE"
+
+    echo ""
+    echo "=== Active Fake Bluetooth Devices ==="
+    for ((i=0; i<DEVICE_COUNT; i++)); do
+        local name_var="DEVICE_${i}_NAME"
+        local addr_var="DEVICE_${i}_ADDR"
+        local class_var="DEVICE_${i}_CLASS"
+        local hci_var="DEVICE_${i}_HCI"
+        local hci="${!hci_var:-}"
+        local live_addr=""
+        [[ -n "$hci" ]] && live_addr=$(hciconfig "$hci" 2>/dev/null | awk '/BD Address/ {print $3}')
+        printf "  [%d] %-6s  name: %-20s  addr: %-18s  class: %s\n" \
+            $((i+1)) "$hci" "${!name_var}" "${!addr_var}" "${!class_var}"
+        [[ -n "$live_addr" && "$live_addr" != "${!addr_var}" ]] && \
+            printf "         live addr: %s\n" "$live_addr"
+    done
+    echo ""
+    hciconfig 2>/dev/null | grep -E 'hci[0-9]+:|BD Address|UP|DOWN' | \
+        sed 's/^/  /' || true
+    echo ""
+}
+
+# ── cmd: exec ─────────────────────────────────────────────────────────────────
+
+cmd_bt_exec() {
+    _bt_check_state
+
+    [[ $# -eq 0 ]] && die "Usage: rpi-bluetooth exec [image] <command> [args...]"
+
+    local img; img=$(_parse_image_arg "$1")
+    [[ -n "$img" ]] && shift
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -eq 0 ]] && die "No command specified."
+    [[ -z "$img" ]] && img=$(pick_image)
+
+    docker_chroot_run "$img" "0" "host" "$@"
+}
+
+# ── cmd: shell ────────────────────────────────────────────────────────────────
+
+cmd_bt_shell() {
+    _bt_check_state
+
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    local name; name=$(slug "$img")
+    echo ""
+    echo "=== Bluetooth Shell: $name ==="
+    info "Virtual HCI adapters visible inside chroot"
+    echo "Type 'exit' to leave the Pi shell."
+    echo ""
+
+    docker_chroot_run "$img" "1" "host"
+}
+
+# ── cmd: help ─────────────────────────────────────────────────────────────────
+
+cmd_bt_help() {
+    cat <<EOF
+
+  rpi-bluetooth — Fake Bluetooth device emulation for Pi images
+
+  COMMANDS
+    rpi-bluetooth start              Interactive wizard: create 1-5 fake BT devices
+    rpi-bluetooth stop               Tear down all fake devices (full cleanup)
+    rpi-bluetooth list               Show active devices with live hciconfig status
+    rpi-bluetooth exec [img] <cmd>   Run command in image with BT devices active
+    rpi-bluetooth shell [img]        Open interactive shell with BT devices active
+    rpi-bluetooth help               This help text
+
+  DEVICE CLASSES
+    phone     — Mobile phone  (class 0x200404)
+    computer  — Laptop/PC     (class 0x100104)
+    audio     — Headset/speaker (class 0x200418)
+    none      — BLE-only / unspecified
+
+  HOW IT WORKS
+    1. Loads hci_vhci kernel module (creates /dev/vhci)
+    2. Opens one /dev/vhci fd per device → kernel creates hci1, hci2, ...
+    3. Configures each adapter: fake BD address, name, class, piscan mode
+    4. Pi chroot runs with --privileged --network host, seeing all hciN adapters
+    5. On stop: kills fd-holder processes, brings down adapters, unloads module
+
+  CLEANUP GUARANTEE
+    rpi-bluetooth stop removes virtual adapters and unloads hci_vhci only if
+    this session loaded it — pre-existing BT hardware is untouched.
+
+  REQUIREMENTS
+    bluez (hciconfig, hcitool, btmgmt), sudo
+
+EOF
+}
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    start)       cmd_bt_start ;;
+    stop)        cmd_bt_stop ;;
+    list)        cmd_bt_list ;;
+    exec)        shift; cmd_bt_exec "$@" ;;
+    shell)       cmd_bt_shell "${2:-}" ;;
+    help|--help|-h) cmd_bt_help ;;
+    *)           cmd_bt_help; exit 1 ;;
+esac

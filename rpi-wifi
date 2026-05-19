@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/docker_exec.sh"
+
+WIFI_STATE_FILE="/tmp/rpi-wifi-state"
+CAPTIVE_GW="192.168.99.1"
+CAPTIVE_RANGE="192.168.99.10,192.168.99.100,1h"
+CHANNELS=(1 6 11)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+_wifi_check_state() {
+    if [[ ! -f "$WIFI_STATE_FILE" ]]; then
+        die "WiFi emulation not running. Run: rpi-wifi start"
+    fi
+    # Stale state check: state file exists but no labeled containers running
+    if ! docker ps -q --filter "label=rpi-wifi=true" 2>/dev/null | grep -q .; then
+        info "WARNING: State file exists but no WiFi containers are running — cleaning up stale state."
+        rm -f "$WIFI_STATE_FILE"
+        die "Run: rpi-wifi start"
+    fi
+}
+
+# ── cmd: start ────────────────────────────────────────────────────────────────
+
+cmd_wifi_start() {
+    [[ -f "$WIFI_STATE_FILE" ]] && die "WiFi emulation already running. Run: rpi-wifi stop first."
+    command -v docker &>/dev/null || die "docker not found"
+    sudo -n true 2>/dev/null || die "sudo access required (run: sudo -v)"
+
+    # ── wizard ────────────────────────────────────────────────────────────────
+    echo ""
+    echo "=== WiFi Emulation Setup ==="
+    echo ""
+    read -rp "Number of fake networks [1-3, default 1]: " n_input
+    local N="${n_input:-1}"
+    [[ "$N" =~ ^[1-3]$ ]] || die "Choose 1, 2, or 3"
+
+    local SSIDS=() TYPES=() PASSES=()
+    for ((i=0; i<N; i++)); do
+        echo ""
+        echo "--- Network $((i+1)) of $N ---"
+        read -rp "  SSID: " ssid
+        [[ -n "$ssid" ]] || die "SSID cannot be empty"
+
+        echo "  Type:  [1] open  [2] WPA2-password  [3] captive-portal"
+        read -rp "  Type [1-3, default 1]: " t_input
+        local t="${t_input:-1}"
+        local type pass=""
+        case "$t" in
+            1) type="open" ;;
+            2) type="wpa2"
+               while [[ ${#pass} -lt 8 || ${#pass} -gt 63 ]]; do
+                   read -rp "  WPA2 password (8-63 chars): " pass
+               done ;;
+            3) type="captive-portal" ;;
+            *) die "Invalid type (choose 1-3)" ;;
+        esac
+        SSIDS+=("$ssid")
+        TYPES+=("$type")
+        PASSES+=("$pass")
+    done
+
+    # ── load mac80211_hwsim ────────────────────────────────────────────────────
+    section "Loading virtual WiFi hardware"
+
+    local IFACES_BEFORE
+    mapfile -t IFACES_BEFORE < <(_get_wireless_ifaces 2>/dev/null || true)
+
+    local MODULE_LOADED_BY_US=0
+    if ! lsmod | grep -q '^mac80211_hwsim'; then
+        sudo modprobe mac80211_hwsim radios=$((N+1))
+        MODULE_LOADED_BY_US=1
+        info "Loaded mac80211_hwsim with $((N+1)) radios"
+    else
+        info "mac80211_hwsim already loaded"
+    fi
+
+    sleep 0.8  # let kernel register new interfaces
+
+    local ALL_WLAN
+    mapfile -t ALL_WLAN < <(_get_wireless_ifaces 2>/dev/null || true)
+
+    # Find newly appeared interfaces
+    local NEW_WLAN=()
+    for iface in "${ALL_WLAN[@]}"; do
+        if ! printf '%s\n' "${IFACES_BEFORE[@]}" 2>/dev/null | grep -qx "$iface"; then
+            NEW_WLAN+=("$iface")
+        fi
+    done
+
+    # If module was pre-existing, assume all current wireless ifaces are available
+    if [[ ${#NEW_WLAN[@]} -eq 0 && "$MODULE_LOADED_BY_US" -eq 0 ]]; then
+        NEW_WLAN=("${ALL_WLAN[@]}")
+    fi
+
+    if [[ ${#NEW_WLAN[@]} -lt $((N+1)) ]]; then
+        [[ "$MODULE_LOADED_BY_US" -eq 1 ]] && sudo modprobe -r mac80211_hwsim 2>/dev/null || true
+        die "Expected $((N+1)) wireless interfaces, got ${#NEW_WLAN[@]}. Check mac80211_hwsim."
+    fi
+
+    local PI_IFACE="${NEW_WLAN[0]}"
+    local AP_IFACES=("${NEW_WLAN[@]:1:$N}")
+
+    info "Pi client interface : $PI_IFACE"
+    for ((i=0; i<N; i++)); do
+        info "AP $((i+1)) interface    : ${AP_IFACES[$i]}"
+    done
+
+    # ── build hostapd image (once, cached) ────────────────────────────────────
+    section "Preparing hostapd image"
+    if ! docker image inspect rpi-hostapd:local &>/dev/null; then
+        info "Building rpi-hostapd:local (one-time, ~2 min)..."
+        docker build -t rpi-hostapd:local - <<'DOCKERFILE'
+FROM ubuntu:24.04
+RUN apt-get update -qq && apt-get install -qq -y hostapd iw && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+        info "Done."
+    else
+        info "Using cached rpi-hostapd:local"
+    fi
+
+    # ── initialise state file ─────────────────────────────────────────────────
+    cat > "$WIFI_STATE_FILE" <<EOF
+MODULE_LOADED_BY_US=$MODULE_LOADED_BY_US
+RADIO_COUNT=$N
+PI_IFACE=$PI_IFACE
+CAPTIVE_IFACE=
+CAPTIVE_DNSMASQ_PID=
+CAPTIVE_PORTAL_CONTAINER=
+EOF
+
+    # ── start hostapd per AP ──────────────────────────────────────────────────
+    section "Starting fake access points"
+
+    local captive_iface=""
+    for ((i=0; i<N; i++)); do
+        local ssid="${SSIDS[$i]}"
+        local type="${TYPES[$i]}"
+        local pass="${PASSES[$i]}"
+        local iface="${AP_IFACES[$i]}"
+        local channel="${CHANNELS[$((i % 3))]}"
+        local conf_dir
+        conf_dir=$(mktemp -d /tmp/rpi-hostapd-XXXXXX)
+
+        local tmpl
+        [[ "$type" == "wpa2" ]] && tmpl="$CONFIGS_DIR/hostapd/wpa2.conf.tmpl" \
+                                 || tmpl="$CONFIGS_DIR/hostapd/open.conf.tmpl"
+
+        sed -e "s|%%IFACE%%|$iface|g" \
+            -e "s|%%SSID%%|$ssid|g" \
+            -e "s|%%CHANNEL%%|$channel|g" \
+            -e "s|%%PASSPHRASE%%|$pass|g" \
+            "$tmpl" > "$conf_dir/hostapd.conf"
+
+        local cid
+        cid=$(docker run -d \
+            --rm \
+            --network host \
+            --privileged \
+            --label rpi-wifi=true \
+            -v "$conf_dir:/conf" \
+            rpi-hostapd:local \
+            hostapd /conf/hostapd.conf)
+
+        info "AP $((i+1)): SSID=\"$ssid\"  type=$type  iface=$iface  ch=$channel  (${cid:0:12})"
+
+        cat >> "$WIFI_STATE_FILE" <<EOF
+NETWORK_${i}_SSID=$ssid
+NETWORK_${i}_TYPE=$type
+NETWORK_${i}_PASS=$pass
+NETWORK_${i}_IFACE=$iface
+NETWORK_${i}_CHANNEL=$channel
+NETWORK_${i}_CONF_DIR=$conf_dir
+NETWORK_${i}_CONTAINER=$cid
+EOF
+
+        [[ "$type" == "captive-portal" ]] && captive_iface="$iface"
+    done
+
+    # ── captive portal extras ─────────────────────────────────────────────────
+    if [[ -n "$captive_iface" ]]; then
+        section "Starting captive portal"
+
+        sudo ip addr add "$CAPTIVE_GW/24" dev "$captive_iface" 2>/dev/null || true
+        sudo ip link set "$captive_iface" up
+
+        # dnsmasq: redirect all DNS to gateway + serve DHCP
+        sudo dnsmasq \
+            --no-daemon \
+            --no-resolv \
+            --address="/#/$CAPTIVE_GW" \
+            --dhcp-range="$CAPTIVE_RANGE" \
+            --interface="$captive_iface" \
+            --pid-file=/tmp/rpi-captive-dnsmasq.pid \
+            --log-facility=/dev/null &
+        local dnsmasq_bg=$!
+        sleep 0.3
+        local dnsmasq_pid
+        dnsmasq_pid=$(cat /tmp/rpi-captive-dnsmasq.pid 2>/dev/null || echo "$dnsmasq_bg")
+        info "dnsmasq started (pid $dnsmasq_pid) — all DNS → $CAPTIVE_GW"
+
+        # Python3 captive portal HTTP server in Docker
+        local portal_cid
+        portal_cid=$(docker run -d \
+            --rm \
+            --network host \
+            --label rpi-wifi=true \
+            -v "$CONFIGS_DIR/captive:/portal:ro" \
+            ubuntu:24.04 \
+            python3 /portal/portal.py)
+        info "Captive portal HTTP server started (${portal_cid:0:12})"
+
+        # Update state file
+        sed -i \
+            -e "s|^CAPTIVE_IFACE=.*|CAPTIVE_IFACE=$captive_iface|" \
+            -e "s|^CAPTIVE_DNSMASQ_PID=.*|CAPTIVE_DNSMASQ_PID=$dnsmasq_pid|" \
+            -e "s|^CAPTIVE_PORTAL_CONTAINER=.*|CAPTIVE_PORTAL_CONTAINER=$portal_cid|" \
+            "$WIFI_STATE_FILE"
+    fi
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    echo ""
+    echo "=== WiFi Emulation Active ==="
+    for ((i=0; i<N; i++)); do
+        local ssid="${SSIDS[$i]}" type="${TYPES[$i]}" pass="${PASSES[$i]}"
+        local iface="${AP_IFACES[$i]}"
+        printf "  %-8s  SSID: %-25s  type: %-15s" "$iface" "\"$ssid\"" "$type"
+        [[ "$type" == "wpa2" ]] && printf "  pass: %s" "$pass"
+        echo ""
+    done
+    echo ""
+    info "Pi client iface : $PI_IFACE"
+    info "Run commands    : rpi-wifi exec [image] <cmd>"
+    info "Open shell      : rpi-wifi shell [image]"
+    info "Tear down       : rpi-wifi stop"
+    echo ""
+}
+
+# ── cmd: stop ─────────────────────────────────────────────────────────────────
+
+cmd_wifi_stop() {
+    if [[ ! -f "$WIFI_STATE_FILE" ]]; then
+        info "No active WiFi emulation."
+        return 0
+    fi
+
+    section "Stopping WiFi emulation"
+
+    # Source state
+    local MODULE_LOADED_BY_US=0 RADIO_COUNT=0 PI_IFACE="" CAPTIVE_IFACE=""
+    local CAPTIVE_DNSMASQ_PID="" CAPTIVE_PORTAL_CONTAINER=""
+    source "$WIFI_STATE_FILE"
+
+    # Stop all labeled Docker containers
+    local containers
+    containers=$(docker ps -q --filter "label=rpi-wifi=true" 2>/dev/null || true)
+    if [[ -n "$containers" ]]; then
+        info "Stopping Docker containers..."
+        echo "$containers" | xargs docker stop -t 5 2>/dev/null || true
+    fi
+
+    # Stop dnsmasq
+    if [[ -n "$CAPTIVE_DNSMASQ_PID" ]] && kill -0 "$CAPTIVE_DNSMASQ_PID" 2>/dev/null; then
+        sudo kill "$CAPTIVE_DNSMASQ_PID" 2>/dev/null || true
+        info "Stopped dnsmasq (pid $CAPTIVE_DNSMASQ_PID)"
+    fi
+    if [[ -f /tmp/rpi-captive-dnsmasq.pid ]]; then
+        sudo kill "$(cat /tmp/rpi-captive-dnsmasq.pid)" 2>/dev/null || true
+        rm -f /tmp/rpi-captive-dnsmasq.pid
+    fi
+
+    # Remove captive portal IP
+    if [[ -n "$CAPTIVE_IFACE" ]]; then
+        sudo ip addr del "$CAPTIVE_GW/24" dev "$CAPTIVE_IFACE" 2>/dev/null || true
+    fi
+
+    # Bring down all wireless interfaces we used
+    for ((i=0; i<RADIO_COUNT; i++)); do
+        local iface_var="NETWORK_${i}_IFACE"
+        local iface="${!iface_var:-}"
+        [[ -n "$iface" ]] && sudo ip link set "$iface" down 2>/dev/null || true
+    done
+    [[ -n "$PI_IFACE" ]] && sudo ip link set "$PI_IFACE" down 2>/dev/null || true
+
+    # Unload mac80211_hwsim only if we loaded it
+    if [[ "$MODULE_LOADED_BY_US" == "1" ]]; then
+        info "Unloading mac80211_hwsim..."
+        sudo modprobe -r mac80211_hwsim 2>/dev/null || \
+            info "WARNING: could not unload mac80211_hwsim — some interface may still be in use"
+    else
+        info "(mac80211_hwsim was pre-existing — skipping unload)"
+    fi
+
+    # Remove temp hostapd config dirs
+    for ((i=0; i<RADIO_COUNT; i++)); do
+        local dir_var="NETWORK_${i}_CONF_DIR"
+        local cdir="${!dir_var:-}"
+        [[ -n "$cdir" && -d "$cdir" ]] && rm -rf "$cdir"
+    done
+
+    rm -f "$WIFI_STATE_FILE"
+    info "WiFi emulation stopped."
+    echo ""
+}
+
+# ── cmd: list ─────────────────────────────────────────────────────────────────
+
+cmd_wifi_list() {
+    if [[ ! -f "$WIFI_STATE_FILE" ]]; then
+        info "No active WiFi emulation."
+        return 0
+    fi
+
+    local MODULE_LOADED_BY_US=0 RADIO_COUNT=0 PI_IFACE=""
+    source "$WIFI_STATE_FILE"
+
+    echo ""
+    echo "=== Active Fake WiFi Networks ==="
+    for ((i=0; i<RADIO_COUNT; i++)); do
+        local ssid  type  pass  iface  channel
+        ssid=$(grep    "^NETWORK_${i}_SSID="    "$WIFI_STATE_FILE" | cut -d= -f2-)
+        type=$(grep    "^NETWORK_${i}_TYPE="    "$WIFI_STATE_FILE" | cut -d= -f2-)
+        pass=$(grep    "^NETWORK_${i}_PASS="    "$WIFI_STATE_FILE" | cut -d= -f2-)
+        iface=$(grep   "^NETWORK_${i}_IFACE="   "$WIFI_STATE_FILE" | cut -d= -f2-)
+        channel=$(grep "^NETWORK_${i}_CHANNEL=" "$WIFI_STATE_FILE" | cut -d= -f2-)
+        printf "  [%d] %-8s  SSID: %-25s  type: %-15s  ch:%s" \
+            $((i+1)) "$iface" "\"$ssid\"" "$type" "$channel"
+        [[ "$type" == "wpa2" ]] && printf "  pass: %s" "$pass"
+        echo ""
+    done
+
+    echo ""
+    echo "  Docker containers:"
+    docker ps --filter "label=rpi-wifi=true" \
+        --format "    {{.ID}}  {{.Status}}  {{.Command}}" 2>/dev/null || true
+    echo ""
+    info "Pi client interface: $PI_IFACE"
+    echo ""
+}
+
+# ── cmd: exec ─────────────────────────────────────────────────────────────────
+
+cmd_wifi_exec() {
+    _wifi_check_state
+
+    [[ $# -eq 0 ]] && die "Usage: rpi-wifi exec [image] <command> [args...]"
+
+    local img; img=$(_parse_image_arg "$1")
+    [[ -n "$img" ]] && shift
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -eq 0 ]] && die "No command specified."
+    [[ -z "$img" ]] && img=$(pick_image)
+
+    docker_chroot_run "$img" "0" "host" "$@"
+}
+
+# ── cmd: shell ────────────────────────────────────────────────────────────────
+
+cmd_wifi_shell() {
+    _wifi_check_state
+
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    local name; name=$(slug "$img")
+    echo ""
+    echo "=== WiFi Shell: $name ==="
+    info "WiFi emulation active — wlan interfaces visible inside chroot"
+    echo "Type 'exit' to leave the Pi shell."
+    echo ""
+
+    docker_chroot_run "$img" "1" "host"
+}
+
+# ── cmd: help ─────────────────────────────────────────────────────────────────
+
+cmd_wifi_help() {
+    cat <<EOF
+
+  rpi-wifi — Fake WiFi network emulation for Pi images
+
+  COMMANDS
+    rpi-wifi start              Interactive wizard: spin up 1-3 fake APs
+    rpi-wifi stop               Tear down all fake networks (full cleanup)
+    rpi-wifi list               Show active networks and containers
+    rpi-wifi exec [img] <cmd>   Run command in image with WiFi active
+    rpi-wifi shell [img]        Open interactive shell with WiFi active
+    rpi-wifi help               This help text
+
+  NETWORK TYPES
+    open            No password — Pi can connect freely
+    wpa2            WPA2-PSK — password injected into wpa_supplicant.conf
+    captive-portal  Open network with DNS redirect + HTTP splash page
+
+  HOW IT WORKS
+    1. Loads mac80211_hwsim kernel module (creates virtual wlanN interfaces)
+    2. Starts hostapd in Docker containers to broadcast fake SSIDs
+    3. Pi chroot runs with --network host so it sees the virtual wlanN ifaces
+    4. For WPA2: wpa_supplicant.conf is temporarily injected (restored on exit)
+    5. For captive portal: dnsmasq redirects all DNS to 192.168.99.1
+
+  CLEANUP GUARANTEE
+    rpi-wifi stop removes all containers, unloads the kernel module only if
+    rpi-wifi loaded it, restores any modified config files, removes temp dirs.
+
+  REQUIREMENTS
+    docker, sudo, fdisk, dnsmasq (for captive-portal)
+
+EOF
+}
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    start)       cmd_wifi_start ;;
+    stop)        cmd_wifi_stop ;;
+    list)        cmd_wifi_list ;;
+    exec)        shift; cmd_wifi_exec "$@" ;;
+    shell)       cmd_wifi_shell "${2:-}" ;;
+    help|--help|-h) cmd_wifi_help ;;
+    *)           cmd_wifi_help; exit 1 ;;
+esac

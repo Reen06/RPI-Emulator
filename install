@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RPI_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+INSTALL_DIR="${HOME}/.local/bin"
+
+mkdir -p "$INSTALL_DIR"
+
+for script in rpi rpi-wifi rpi-bluetooth; do
+    target="$RPI_HOME/$script"
+    link="$INSTALL_DIR/$script"
+    if [[ ! -f "$target" ]]; then
+        echo "WARNING: $target not found, skipping"
+        continue
+    fi
+    chmod +x "$target"
+    ln -sf "$target" "$link"
+    echo "  Linked: $link -> $target"
+done
+
+if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
+    echo ""
+    echo "NOTE: Add ~/.local/bin to your PATH:"
+    echo '  export PATH="$HOME/.local/bin:$PATH"'
+fi
+
+echo ""
+echo "Installation complete. Run: rpi help"
