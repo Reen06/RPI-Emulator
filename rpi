@@ -1,0 +1,680 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RPI_HOME="$HOME/RPI"
+IMAGES_DIR="$RPI_HOME/images"
+DISKS_DIR="$RPI_HOME/disks"
+KERNELS_DIR="$RPI_HOME/kernels"
+OS_LIST_URL="https://downloads.raspberrypi.com/os_list_imagingutility_v3.json"
+DEFAULT_USER="pi"
+DEFAULT_PASS="raspberry"
+SSH_PORT=2222
+
+# Docker images used when native binaries aren't installed
+QEMU_DOCKER_IMG="hectorm/qemu-user-static:latest"
+QEMU_SYS_IMG="hectorm/qemu-user-static:latest"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "  $*"; }
+
+slug() {
+    basename "$1" | sed 's/\.[^.]*$//' | tr ' ' '_'
+}
+
+# Returns path to qemu-img, either native or via docker wrapper
+qemu_img() {
+    if command -v qemu-img &>/dev/null; then
+        qemu-img "$@"
+    else
+        docker run --rm \
+            -v "$(pwd):/work" -w /work \
+            -v "$DISKS_DIR:$DISKS_DIR" \
+            -v "$IMAGES_DIR:$IMAGES_DIR" \
+            ubuntu:24.04 bash -c "apt-get install -qq -y qemu-utils 2>/dev/null; qemu-img $*"
+    fi
+}
+
+pick_image() {
+    local images=("$IMAGES_DIR"/*.img)
+    [[ -e "${images[0]}" ]] || die "No images in $IMAGES_DIR. Run: rpi download"
+    if [[ ${#images[@]} -eq 1 ]]; then
+        echo "${images[0]}"
+        return
+    fi
+    echo ""
+    echo "Available images:"
+    local i=1
+    for img in "${images[@]}"; do
+        printf "  [%d] %s  (%s)\n" "$i" "$(basename "$img")" "$(du -sh "$img" 2>/dev/null | cut -f1)"
+        ((i++))
+    done
+    echo ""
+    read -rp "Select image [1-$((i-1))]: " sel
+    [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le $((i-1)) ]] || die "Invalid selection"
+    echo "${images[$((sel-1))]}"
+}
+
+# ── cmd: list ─────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    echo ""
+    echo "=== Local Images ($IMAGES_DIR) ==="
+    if compgen -G "$IMAGES_DIR/*.img" &>/dev/null; then
+        printf "  %-52s %8s  %s\n" "Name" "Size" "Modified"
+        printf "  %-52s %8s  %s\n" "----" "----" "--------"
+        for img in "$IMAGES_DIR"/*.img; do
+            local size mod
+            size=$(du -sh "$img" 2>/dev/null | cut -f1)
+            mod=$(date -r "$img" "+%Y-%m-%d %H:%M" 2>/dev/null || stat -c %y "$img" | cut -d' ' -f1,2 | cut -d'.' -f1)
+            printf "  %-52s %8s  %s\n" "$(basename "$img")" "$size" "$mod"
+        done
+    else
+        info "No images found. Run: rpi download"
+    fi
+
+    echo ""
+    echo "=== Running Instances ==="
+    local running=0
+    for pid_file in /tmp/rpi-*.pid; do
+        [[ -e "$pid_file" ]] || continue
+        local pid name
+        pid=$(cat "$pid_file")
+        name=$(basename "$pid_file" .pid | sed 's/^rpi-//')
+        if kill -0 "$pid" 2>/dev/null; then
+            info "$name  (pid $pid, ssh: localhost:$SSH_PORT)"
+            ((running++))
+        else
+            rm -f "$pid_file"
+        fi
+    done
+    [[ $running -eq 0 ]] && info "None"
+    echo ""
+}
+
+# ── cmd: download ─────────────────────────────────────────────────────────────
+
+cmd_download() {
+    command -v curl &>/dev/null || die "curl not found"
+    command -v wget &>/dev/null || die "wget not found"
+
+    echo ""
+    echo "=== Fetching Raspberry Pi OS catalog... ==="
+    local tmp
+    tmp=$(mktemp /tmp/rpi-os-list.XXXXXX.json)
+    curl -sf "$OS_LIST_URL" -o "$tmp" || die "Failed to fetch OS list"
+
+    # Flatten nested subitems and filter arm64 images
+    local entries
+    entries=$(jq -r '
+      [.os_list[] |
+        (if .subitems then .subitems[] else . end) |
+        select(.url? and (.url | test("arm64|aarch64|_64"; "i"))) |
+        {name, description, url}
+      ] | to_entries[] |
+      "\(.key+1)\t\(.value.name)\t\(.value.url)"
+    ' "$tmp" 2>/dev/null || true)
+
+    if [[ -z "$entries" ]]; then
+        entries=$(jq -r '
+          [.os_list[] |
+            (if .subitems then .subitems[] else . end) |
+            select(.url?) |
+            {name, description, url}
+          ] | to_entries[] |
+          "\(.key+1)\t\(.value.name)\t\(.value.url)"
+        ' "$tmp")
+    fi
+
+    echo ""
+    echo "Available 64-bit images:"
+    echo ""
+    local max_idx=0
+    while IFS=$'\t' read -r idx name url; do
+        printf "  [%3s] %s\n" "$idx" "$name"
+        max_idx=$idx
+    done <<< "$entries"
+    echo ""
+
+    read -rp "Select image [1-$max_idx] or q to cancel: " sel
+    [[ "$sel" == "q" || "$sel" == "Q" ]] && { echo "Cancelled."; return; }
+    [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le "$max_idx" ]] || die "Invalid selection"
+
+    local chosen_url chosen_name
+    chosen_url=$(awk -v idx="$sel" 'NR==idx {print $3}' FS=$'\t' <<< "$entries")
+    chosen_name=$(awk -v idx="$sel" 'NR==idx {print $2}' FS=$'\t' <<< "$entries")
+    rm -f "$tmp"
+
+    local filename dest
+    filename=$(basename "$chosen_url")
+    dest="$IMAGES_DIR/$filename"
+
+    echo ""
+    echo "Downloading: $chosen_name"
+    echo "Destination: $dest"
+    echo ""
+
+    wget -c "$chosen_url" -O "$dest"
+
+    if [[ "$dest" == *.xz ]]; then
+        echo ""
+        echo "Decompressing..."
+        xz -d "$dest"
+        echo "Extracted: ${dest%.xz}"
+    elif [[ "$dest" == *.zip ]]; then
+        echo ""
+        echo "Decompressing..."
+        unzip -o "$dest" -d "$IMAGES_DIR"
+        rm -f "$dest"
+    fi
+
+    echo ""
+    echo "Done. Run 'rpi list' to see your images."
+}
+
+# ── cmd: shell (Docker-based, no apt needed) ──────────────────────────────────
+
+cmd_shell() {
+    command -v docker &>/dev/null || die "docker not found"
+    command -v fdisk  &>/dev/null || die "fdisk not found (install util-linux)"
+
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    local name
+    name=$(slug "$img")
+
+    echo ""
+    echo "=== Quick Shell: $name ==="
+    info "Mounting image and opening arm64 shell via Docker..."
+    echo ""
+
+    local sector_size boot_offset root_offset
+    sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
+    boot_offset=$(fdisk -l "$img" | awk '/FAT/ || /W95 FAT/ || / b / {print $2 * '"$sector_size"'; exit}')
+    root_offset=$(fdisk -l "$img"  | awk '/Linux/ {print $2 * '"$sector_size"'; exit}')
+
+    [[ -z "$boot_offset" ]] && die "Could not find boot partition in image"
+    [[ -z "$root_offset" ]] && die "Could not find root partition in image"
+
+    local root_mnt
+    root_mnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+
+    _cleanup_shell() {
+        sudo umount "$root_mnt/boot" 2>/dev/null || true
+        sudo umount "$root_mnt/proc" 2>/dev/null || true
+        sudo umount "$root_mnt/sys"  2>/dev/null || true
+        sudo umount "$root_mnt/dev/pts" 2>/dev/null || true
+        sudo umount "$root_mnt/dev"  2>/dev/null || true
+        sudo umount "$root_mnt"      2>/dev/null || true
+        rm -rf "$root_mnt"
+    }
+    trap _cleanup_shell EXIT INT TERM
+
+    sudo mount -o loop,offset="$root_offset" "$img" "$root_mnt"
+    sudo mount -o loop,offset="$boot_offset" "$img" "$root_mnt/boot"
+    sudo mount --bind /proc    "$root_mnt/proc"
+    sudo mount --bind /sys     "$root_mnt/sys"
+    sudo mount --bind /dev     "$root_mnt/dev"
+    sudo mount --bind /dev/pts "$root_mnt/dev/pts"
+
+    echo "Type 'exit' to leave the Pi shell."
+    echo ""
+
+    docker run --rm -it \
+        --platform linux/arm64 \
+        --privileged \
+        -v "$root_mnt:/rpi" \
+        -w /rpi \
+        ubuntu:24.04 \
+        chroot /rpi /bin/bash || true
+}
+
+# ── cmd: run (full QEMU emulation) ───────────────────────────────────────────
+
+cmd_run() {
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    # Prefer native qemu-system-aarch64; fall back to a helpful message
+    if ! command -v qemu-system-aarch64 &>/dev/null; then
+        echo ""
+        echo "Full QEMU emulation requires qemu-system-arm."
+        echo "Install it with:"
+        echo "  sudo apt install -y qemu-system-arm qemu-utils"
+        echo ""
+        echo "After installing, re-run: rpi run"
+        echo ""
+        echo "Alternatively, use 'rpi shell' for instant arm64 access via Docker (no install needed)."
+        return 1
+    fi
+
+    command -v fdisk &>/dev/null || die "fdisk not found"
+
+    local name
+    name=$(slug "$img")
+    local disk="$DISKS_DIR/$name.qcow2"
+    local kdir="$KERNELS_DIR/$name"
+
+    echo ""
+    echo "=== Preparing: $name ==="
+
+    if [[ ! -f "$disk" ]]; then
+        info "Converting to qcow2 (first run only)..."
+        qemu-img convert -f raw -O qcow2 "$img" "$disk"
+        info "Disk: $disk"
+    else
+        info "Using existing disk: $disk"
+    fi
+
+    if [[ ! -f "$kdir/kernel8.img" ]]; then
+        info "Extracting kernel and DTB from boot partition..."
+        mkdir -p "$kdir"
+
+        local sector_size offset
+        sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
+        offset=$(fdisk -l "$img" | awk '/FAT/ || /W95 FAT/ || / b / {print $2 * '"$sector_size"'; exit}')
+
+        local mnt
+        mnt=$(mktemp -d /tmp/rpi-boot.XXXXXX)
+        sudo mount -o loop,offset="$offset" "$img" "$mnt"
+
+        cp "$mnt/kernel8.img" "$kdir/" 2>/dev/null || { sudo umount "$mnt"; die "kernel8.img not found"; }
+
+        local dtb_src
+        dtb_src=$(ls "$mnt"/bcm271*.dtb 2>/dev/null | head -1)
+        [[ -n "$dtb_src" ]] && cp "$dtb_src" "$kdir/rpi.dtb" || { sudo umount "$mnt"; die "No DTB file found"; }
+
+        touch "$mnt/ssh"
+
+        if [[ ! -f "$mnt/userconf.txt" ]]; then
+            local hashed
+            hashed=$(echo "$DEFAULT_PASS" | openssl passwd -6 -stdin)
+            echo "${DEFAULT_USER}:${hashed}" | sudo tee "$mnt/userconf.txt" >/dev/null
+            info "Created user: $DEFAULT_USER / $DEFAULT_PASS"
+        fi
+
+        sudo umount "$mnt"
+        rm -rf "$mnt"
+        info "Kernel and DTB extracted to $kdir/"
+    fi
+
+    local pid_file="/tmp/rpi-${name}.pid"
+    if [[ -f "$pid_file" ]]; then
+        local old_pid
+        old_pid=$(cat "$pid_file")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            info "Already running (pid $old_pid). Connecting..."
+            _ssh_connect
+            return
+        fi
+        rm -f "$pid_file"
+    fi
+
+    echo ""
+    echo "=== Starting QEMU (raspi3b) ==="
+    info "SSH will be on localhost:$SSH_PORT"
+    info "Login: $DEFAULT_USER / $DEFAULT_PASS"
+    echo ""
+
+    qemu-system-aarch64 \
+        -M raspi3b \
+        -cpu cortex-a53 \
+        -m 1G \
+        -kernel "$kdir/kernel8.img" \
+        -dtb "$kdir/rpi.dtb" \
+        -drive file="$disk",format=qcow2 \
+        -append "root=/dev/mmcblk0p2 rw rootfstype=ext4 console=ttyAMA0 loglevel=3 net.ifnames=0 dwc_otg.lpm_enable=0" \
+        -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
+        -device usb-net,netdev=net0 \
+        -nographic \
+        -daemonize \
+        -pidfile "$pid_file" 2>/dev/null || {
+            echo "Running in foreground (Ctrl+A X to quit QEMU)..."
+            qemu-system-aarch64 \
+                -M raspi3b \
+                -cpu cortex-a53 \
+                -m 1G \
+                -kernel "$kdir/kernel8.img" \
+                -dtb "$kdir/rpi.dtb" \
+                -drive file="$disk",format=qcow2 \
+                -append "root=/dev/mmcblk0p2 rw rootfstype=ext4 console=ttyAMA0 loglevel=3 net.ifnames=0" \
+                -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
+                -device usb-net,netdev=net0 \
+                -nographic
+            return
+        }
+
+    echo "Waiting for SSH..."
+    local attempts=0
+    while ! nc -z localhost "$SSH_PORT" 2>/dev/null; do
+        ((attempts++))
+        if [[ $attempts -ge 90 ]]; then
+            echo ""
+            echo "Timed out. Pi is still booting — try again in a moment:"
+            echo "  ssh -p $SSH_PORT $DEFAULT_USER@localhost"
+            echo "  rpi stop $name"
+            return 1
+        fi
+        printf "."
+        sleep 2
+    done
+    echo " ready!"
+    echo ""
+
+    _ssh_connect
+
+    echo ""
+    read -rp "Keep VM running in background? [Y/n]: " keep
+    if [[ "${keep,,}" == "n" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && info "VM stopped."
+        rm -f "$pid_file"
+    else
+        info "VM running. To reconnect: rpi run"
+        info "To stop: rpi stop $name"
+    fi
+}
+
+_ssh_connect() {
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -p "$SSH_PORT" \
+        "$DEFAULT_USER@localhost"
+}
+
+# ── cmd: stop ─────────────────────────────────────────────────────────────────
+
+cmd_stop() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo ""
+        echo "Running instances:"
+        local found=0
+        for pid_file in /tmp/rpi-*.pid; do
+            [[ -e "$pid_file" ]] || continue
+            local pid n
+            pid=$(cat "$pid_file")
+            n=$(basename "$pid_file" .pid | sed 's/^rpi-//')
+            kill -0 "$pid" 2>/dev/null && { info "$n (pid $pid)"; ((found++)); } || rm -f "$pid_file"
+        done
+        [[ $found -eq 0 ]] && { info "None running."; return; }
+        echo ""
+        read -rp "Instance name to stop (or 'all'): " name
+    fi
+
+    if [[ "$name" == "all" ]]; then
+        for pid_file in /tmp/rpi-*.pid; do
+            [[ -e "$pid_file" ]] || continue
+            local pid
+            pid=$(cat "$pid_file")
+            kill "$pid" 2>/dev/null && info "Stopped $(basename "$pid_file" .pid | sed 's/^rpi-//')"
+            rm -f "$pid_file"
+        done
+    else
+        local pid_file="/tmp/rpi-${name}.pid"
+        [[ -f "$pid_file" ]] || die "No running instance named: $name"
+        local pid
+        pid=$(cat "$pid_file")
+        kill "$pid" 2>/dev/null && info "Stopped $name (pid $pid)"
+        rm -f "$pid_file"
+    fi
+}
+
+# ── cmd: flash ───────────────────────────────────────────────────────────────
+
+cmd_flash() {
+    command -v lsblk &>/dev/null || die "lsblk not found"
+
+    echo ""
+    echo "=== Flash Image to SD Card ==="
+
+    # Build list of candidate sources: .img files + .qcow2 files
+    local sources=()
+    local labels=()
+    for f in "$IMAGES_DIR"/*.img "$DISKS_DIR"/*.qcow2; do
+        [[ -f "$f" ]] || continue
+        sources+=("$f")
+        local sz
+        sz=$(du -sh "$f" 2>/dev/null | cut -f1)
+        if [[ "$f" == *.qcow2 ]]; then
+            labels+=("$(basename "$f")  [$sz] (QEMU disk — will convert to .img)")
+        else
+            labels+=("$(basename "$f")  [$sz]")
+        fi
+    done
+
+    [[ ${#sources[@]} -eq 0 ]] && die "No images found. Run: rpi download"
+
+    echo ""
+    echo "Select source image:"
+    local i=1
+    for lbl in "${labels[@]}"; do
+        printf "  [%d] %s\n" "$i" "$lbl"
+        ((i++))
+    done
+    echo ""
+    read -rp "Image [1-$((i-1))]: " img_sel
+    [[ "$img_sel" =~ ^[0-9]+$ && "$img_sel" -ge 1 && "$img_sel" -le $((i-1)) ]] || die "Invalid selection"
+
+    local src="${sources[$((img_sel-1))]}"
+    local flash_src="$src"
+
+    # Convert qcow2 → raw img if needed
+    if [[ "$src" == *.qcow2 ]]; then
+        if ! command -v qemu-img &>/dev/null; then
+            die "qemu-img required to convert .qcow2. Install: sudo apt install qemu-utils"
+        fi
+        local converted="$IMAGES_DIR/$(basename "${src%.qcow2}").converted.img"
+        echo ""
+        echo "Converting qcow2 → raw img..."
+        qemu-img convert -f qcow2 -O raw "$src" "$converted"
+        info "Converted: $converted"
+        flash_src="$converted"
+    fi
+
+    local img_bytes
+    img_bytes=$(stat -c%s "$flash_src")
+    local img_human
+    img_human=$(du -sh "$flash_src" | cut -f1)
+
+    # Detect removable block devices only
+    echo ""
+    echo "Detecting removable drives (SD cards, USB)..."
+    echo ""
+
+    local devs=()
+    local dev_labels=()
+
+    while IFS= read -r line; do
+        local dev size model tran
+        dev=$(echo "$line"   | jq -r '.name')
+        size=$(echo "$line"  | jq -r '.size // "?"')
+        model=$(echo "$line" | jq -r '.model // ""')
+        tran=$(echo "$line"  | jq -r '.tran // ""')
+        devs+=("/dev/$dev")
+        dev_labels+=("/dev/$dev  $size  ${model}  [${tran}]")
+    done < <(lsblk -d -o NAME,SIZE,MODEL,TRAN,RM --json 2>/dev/null \
+        | jq -c '.blockdevices[] | select(.rm == true or .tran == "usb" or .tran == "sd")')
+
+    if [[ ${#devs[@]} -eq 0 ]]; then
+        echo "  No removable drives detected."
+        echo ""
+        echo "  Plug in your SD card and re-run, or specify the device manually:"
+        echo "  rpi flash  (then pick the device from the list)"
+        echo ""
+        echo "  Manual flash command:"
+        echo "  sudo dd if=\"$flash_src\" of=/dev/sdX bs=4M status=progress conv=fsync"
+        return 1
+    fi
+
+    local j=1
+    for lbl in "${dev_labels[@]}"; do
+        printf "  [%d] %s\n" "$j" "$lbl"
+        ((j++))
+    done
+    echo ""
+    read -rp "Target device [1-$((j-1))]: " dev_sel
+    [[ "$dev_sel" =~ ^[0-9]+$ && "$dev_sel" -ge 1 && "$dev_sel" -le $((j-1)) ]] || die "Invalid selection"
+
+    local target="${devs[$((dev_sel-1))]}"
+
+    # Size sanity check
+    local dev_bytes
+    dev_bytes=$(lsblk -bdo SIZE "$target" 2>/dev/null | tail -1 | tr -d ' ')
+    if [[ -n "$dev_bytes" && "$img_bytes" -gt "$dev_bytes" ]]; then
+        local dev_human
+        dev_human=$(lsblk -do SIZE "$target" 2>/dev/null | tail -1 | tr -d ' ')
+        echo ""
+        echo "  WARNING: Image ($img_human) is larger than device ($dev_human)."
+        read -rp "  Continue anyway? [y/N]: " force
+        [[ "${force,,}" == "y" ]] || { echo "Aborted."; return 1; }
+    fi
+
+    # Unmount any mounted partitions on the target
+    local mounted
+    mounted=$(lsblk -lno MOUNTPOINT "$target" 2>/dev/null | grep -v '^$' || true)
+    if [[ -n "$mounted" ]]; then
+        echo ""
+        info "Unmounting partitions on $target..."
+        sudo umount "${target}"?* 2>/dev/null || true
+    fi
+
+    # Final confirmation — require typing the device name
+    echo ""
+    echo "  ┌─────────────────────────────────────────────┐"
+    echo "  │  ABOUT TO FLASH — ALL DATA WILL BE ERASED  │"
+    echo "  └─────────────────────────────────────────────┘"
+    echo ""
+    printf "  Source : %s  (%s)\n" "$(basename "$flash_src")" "$img_human"
+    printf "  Target : %s\n" "$target"
+    echo ""
+    read -rp "  Type the device path to confirm (e.g. $target): " confirm
+    [[ "$confirm" == "$target" ]] || { echo "Confirmation mismatch. Aborted."; return 1; }
+
+    echo ""
+    echo "Flashing... (this may take several minutes)"
+    echo ""
+    sudo dd if="$flash_src" of="$target" bs=4M status=progress conv=fsync
+    sync
+
+    echo ""
+    echo "Done! Safely eject the card and insert into your Raspberry Pi."
+    echo ""
+}
+
+# ── cmd: imager ───────────────────────────────────────────────────────────────
+
+cmd_imager() {
+    if command -v rpi-imager &>/dev/null; then
+        echo "Launching rpi-imager..."
+        rpi-imager &
+    else
+        echo "rpi-imager not installed."
+        echo "Install with: sudo apt install -y rpi-imager"
+        echo "Or use 'rpi download' to download images via CLI."
+    fi
+}
+
+# ── cmd: help ─────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<EOF
+
+  rpi — Raspberry Pi image manager
+
+  COMMANDS
+    rpi                   Interactive menu
+    rpi list              List local images and running VMs
+    rpi download          Download an official RPi OS image
+    rpi shell [image]     Instant arm64 shell via Docker (no apt needed)
+    rpi run [image]       Full QEMU boot + SSH (needs qemu-system-arm)
+    rpi flash [image]     Flash image (or qcow2) to an SD card
+    rpi stop [name]       Stop a running QEMU instance
+    rpi imager            Launch rpi-imager GUI
+    rpi help              This help text
+
+  PATHS
+    Images:  $IMAGES_DIR
+    Disks:   $DISKS_DIR
+    Kernels: $KERNELS_DIR
+
+  REQUIREMENTS
+    rpi list/download:  curl, wget, jq  (usually pre-installed)
+    rpi shell:          docker, fdisk   (Docker already works on this machine)
+    rpi run:            qemu-system-arm, qemu-utils (needs apt install)
+
+  SSH (run mode)
+    Host: localhost:$SSH_PORT
+    User: $DEFAULT_USER / $DEFAULT_PASS
+
+EOF
+}
+
+# ── interactive menu ──────────────────────────────────────────────────────────
+
+cmd_menu() {
+    while true; do
+        local img_count=0
+        compgen -G "$IMAGES_DIR/*.img" &>/dev/null && img_count=$(ls "$IMAGES_DIR"/*.img 2>/dev/null | wc -l)
+
+        local running_count=0
+        for pid_file in /tmp/rpi-*.pid; do
+            [[ -e "$pid_file" ]] || continue
+            local pid; pid=$(cat "$pid_file")
+            kill -0 "$pid" 2>/dev/null && ((running_count++)) || rm -f "$pid_file"
+        done
+
+        echo ""
+        echo "╔══════════════════════════════════╗"
+        echo "║   Raspberry Pi Manager           ║"
+        printf "║   Images: %-4s  Running: %-4s    ║\n" "$img_count" "$running_count"
+        echo "╠══════════════════════════════════╣"
+        echo "║  [1] List images & instances     ║"
+        echo "║  [2] Download image              ║"
+        echo "║  [3] Shell into image (Docker)   ║"
+        echo "║  [4] Run image (full QEMU)       ║"
+        echo "║  [5] Flash image to SD card      ║"
+        echo "║  [6] Stop a running instance     ║"
+        echo "║  [7] Launch rpi-imager GUI       ║"
+        echo "║  [Q] Quit                        ║"
+        echo "╚══════════════════════════════════╝"
+        echo ""
+        read -rp "  Select: " choice
+
+        case "${choice,,}" in
+            1) cmd_list ;;
+            2) cmd_download ;;
+            3) cmd_shell ;;
+            4) cmd_run ;;
+            5) cmd_flash ;;
+            6) cmd_stop ;;
+            7) cmd_imager ;;
+            q) echo "Bye."; exit 0 ;;
+            *) echo "  Invalid choice." ;;
+        esac
+    done
+}
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
+mkdir -p "$IMAGES_DIR" "$DISKS_DIR" "$KERNELS_DIR"
+
+case "${1:-menu}" in
+    list)     cmd_list ;;
+    download) cmd_download ;;
+    run)      cmd_run "${2:-}" ;;
+    shell)    cmd_shell "${2:-}" ;;
+    flash)    cmd_flash ;;
+    stop)     cmd_stop "${2:-}" ;;
+    imager)   cmd_imager ;;
+    help|--help|-h) cmd_help ;;
+    menu|*)   cmd_menu ;;
+esac

@@ -1,0 +1,9 @@
+images/
+disks/
+kernels/
+Default/
+*.img
+*.qcow2
+*.xz
+*.zip
+/tmp/
