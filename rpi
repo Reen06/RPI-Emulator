@@ -191,8 +191,15 @@ cmd_download() {
     read -rp "Give this image a label? (press ENTER to skip): " lbl_input
     if [[ -n "$lbl_input" ]]; then
         cmd_label "$lbl_input" "$final_img"
+        final_img="$IMAGES_DIR/${lbl_input}__$(basename "$final_img")"
     else
         echo "Done. Run 'rpi list' to see your images."
+    fi
+
+    echo ""
+    read -rp "Customize this image now (set user/password/SSH/etc.)? [y/N]: " do_customize
+    if [[ "$do_customize" =~ ^[Yy]$ ]]; then
+        cmd_shell "$final_img"
     fi
 }
 
@@ -204,14 +211,22 @@ cmd_shell() {
     [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
     [[ -f "$img" ]] || die "Image not found: $img"
 
-    local name; name=$(slug "$img")
     echo ""
-    echo "=== Quick Shell: $name ==="
+    read -rp "Shell as user [root]: " shell_user
+    shell_user="${shell_user:-root}"
+
+    local name; name=$(_image_display_name "$img")
+    echo ""
+    echo "=== Quick Shell: $name (user: $shell_user) ==="
     info "Mounting image and opening arm64 shell via Docker..."
     echo "Type 'exit' to leave the Pi shell."
     echo ""
 
-    docker_chroot_run "$img" "1" "bridge"
+    if [[ "$shell_user" == "root" ]]; then
+        docker_chroot_run "$img" "1" "bridge"
+    else
+        docker_chroot_run "$img" "1" "bridge" su - "$shell_user" -s /bin/bash
+    fi
 }
 
 # ── cmd: run (full QEMU emulation) ───────────────────────────────────────────

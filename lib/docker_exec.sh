@@ -16,21 +16,12 @@ docker_chroot_run() {
     local cmd=("$@")
 
     command -v docker &>/dev/null || die "docker not found"
-    command -v fdisk  &>/dev/null || die "fdisk not found (install util-linux)"
     [[ -f "$img" ]] || die "Image not found: $img"
 
-    local sector_size boot_offset root_offset
-    sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
-    boot_offset=$(fdisk -l "$img" | awk '/FAT/ || /W95 FAT/ || / b / {print $2 * '"$sector_size"'; exit}')
-    root_offset=$(fdisk -l "$img"  | awk '/Linux/ {print $2 * '"$sector_size"'; exit}')
-
-    [[ -z "$boot_offset" ]] && die "No boot partition found in image"
-    [[ -z "$root_offset" ]] && die "No root partition found in image"
-
-    local mnt
     mnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+    local loop_dev=""
 
-    local _wpa_backup=""
+    _wpa_backup=""
 
     _docker_chroot_cleanup() {
         if [[ -n "$_wpa_backup" && -f "$_wpa_backup" ]]; then
@@ -48,12 +39,23 @@ docker_chroot_run() {
         sudo umount "$mnt/dev/pts" 2>/dev/null || true
         sudo umount "$mnt/dev"     2>/dev/null || true
         sudo umount "$mnt"         2>/dev/null || true
+        [[ -n "${loop_dev:-}" ]] && sudo losetup -d "$loop_dev" 2>/dev/null || true
         rm -rf "$mnt"
     }
     trap _docker_chroot_cleanup EXIT INT TERM
 
-    sudo mount -o loop,offset="$root_offset" "$img" "$mnt"
-    sudo mount -o loop,offset="$boot_offset" "$img" "$mnt/boot"
+    # Detach any stale loop devices for this image (left by a failed previous run)
+    while IFS= read -r lo; do
+        sudo losetup -d "$lo" 2>/dev/null || true
+    done < <(losetup -j "$img" 2>/dev/null | cut -d: -f1)
+
+    # Use partscan so both partitions share one loop device — avoids the
+    # "overlapping loop device" error newer kernels raise when two loop
+    # devices point at the same backing file.
+    loop_dev=$(sudo losetup --find --show --partscan "$img") \
+        || die "losetup failed for $img"
+    sudo mount "${loop_dev}p2" "$mnt"
+    sudo mount "${loop_dev}p1" "$mnt/boot"
     sudo mount --bind /proc    "$mnt/proc"
     sudo mount --bind /sys     "$mnt/sys"
     sudo mount --bind /dev     "$mnt/dev"
@@ -64,10 +66,17 @@ docker_chroot_run() {
         _inject_wifi_config "$mnt"
     fi
 
+    local hostname; hostname=$(slug "$img")
+
+    # Ensure the image hostname resolves inside the chroot so sudo doesn't warn
+    if ! grep -q "127.0.1.1" "$mnt/etc/hosts" 2>/dev/null; then
+        echo "127.0.1.1	$hostname" | sudo tee -a "$mnt/etc/hosts" >/dev/null
+    fi
     local docker_flags=(
         --rm
         --platform linux/arm64
         --privileged
+        --hostname "$hostname"
         --network "$network_mode"
         -v "$mnt:/rpi"
         -w /rpi

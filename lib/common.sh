@@ -46,10 +46,6 @@ _image_display_name() {
 pick_image() {
     local images=("$IMAGES_DIR"/*.img)
     [[ -e "${images[0]}" ]] || die "No images in $IMAGES_DIR. Run: rpi download"
-    if [[ ${#images[@]} -eq 1 ]]; then
-        echo "${images[0]}"
-        return
-    fi
     echo "" >&2
     echo "Available images:" >&2
     local i=1
