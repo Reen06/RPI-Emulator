@@ -43,17 +43,62 @@ pick_image() {
         echo "${images[0]}"
         return
     fi
-    echo ""
-    echo "Available images:"
+    echo "" >&2
+    echo "Available images:" >&2
     local i=1
     for img in "${images[@]}"; do
-        printf "  [%d] %s  (%s)\n" "$i" "$(basename "$img")" "$(du -sh "$img" 2>/dev/null | cut -f1)"
+        printf "  [%d] %s  (%s)\n" "$i" "$(basename "$img")" "$(du -sh "$img" 2>/dev/null | cut -f1)" >&2
         ((i++))
     done
-    echo ""
+    echo "" >&2
     read -rp "Select image [1-$((i-1))]: " sel
     [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le $((i-1)) ]] || die "Invalid selection"
     echo "${images[$((sel-1))]}"
+}
+
+# Mount image root partition, run callback, then unmount.  Usage:
+#   _with_image_root <img> <mntvar> <boot:0|1> callback_fn [args...]
+_mount_image_root() {
+    local img="$1" mnt_var="$2" with_boot="$3"
+    shift 3
+
+    local sector_size root_offset boot_offset
+    sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
+    root_offset=$(fdisk -l "$img" | awk '/Linux/ {print $2 * '"$sector_size"'; exit}')
+    boot_offset=$(fdisk -l "$img" | awk '/FAT/ || /W95 FAT/ || / b / {print $2 * '"$sector_size"'; exit}')
+
+    local mnt
+    mnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+    printf -v "$mnt_var" '%s' "$mnt"
+
+    sudo mount -o loop,offset="$root_offset" "$img" "$mnt"
+    [[ "$with_boot" == "1" ]] && sudo mount -o loop,offset="$boot_offset" "$img" "$mnt/boot"
+}
+
+_umount_image_root() {
+    local mnt="$1" with_bind="${2:-0}"
+    [[ "$with_bind" == "1" ]] && {
+        sudo umount "$mnt/boot"    2>/dev/null || true
+        sudo umount "$mnt/proc"   2>/dev/null || true
+        sudo umount "$mnt/sys"    2>/dev/null || true
+        sudo umount "$mnt/dev/pts" 2>/dev/null || true
+        sudo umount "$mnt/dev"    2>/dev/null || true
+    }
+    sudo umount "$mnt" 2>/dev/null || true
+    rm -rf "$mnt"
+}
+
+# Resolve first arg as optional image path; sets $img and shifts caller's args.
+# Usage: _resolve_image "$@" sets global _resolved_img; caller does shift if needed.
+_parse_image_arg() {
+    local first="${1:-}"
+    if [[ -f "$first" ]]; then
+        echo "$first"
+    elif [[ -f "$IMAGES_DIR/$first" ]]; then
+        echo "$IMAGES_DIR/$first"
+    else
+        echo ""
+    fi
 }
 
 # ── cmd: list ─────────────────────────────────────────────────────────────────
@@ -583,6 +628,158 @@ cmd_imager() {
     fi
 }
 
+# ── cmd: exec (non-interactive Docker chroot) ────────────────────────────────
+
+cmd_exec() {
+    command -v docker &>/dev/null || die "docker not found"
+    command -v fdisk  &>/dev/null || die "fdisk not found"
+
+    [[ $# -eq 0 ]] && die "Usage: rpi exec [image] <command> [args...]"
+
+    local img
+    img=$(_parse_image_arg "$1")
+    [[ -n "$img" ]] && shift
+
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -eq 0 ]] && die "No command specified. Usage: rpi exec [image] <command> [args...]"
+
+    [[ -z "$img" ]] && img=$(pick_image)
+
+    local mnt sector_size boot_offset root_offset
+    sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
+    root_offset=$(fdisk -l "$img" | awk '/Linux/ {print $2 * '"$sector_size"'; exit}')
+    boot_offset=$(fdisk -l "$img" | awk '/FAT/ || /W95 FAT/ || / b / {print $2 * '"$sector_size"'; exit}')
+
+    mnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+
+    _cleanup_exec() {
+        sudo umount "$mnt/boot"    2>/dev/null || true
+        sudo umount "$mnt/proc"   2>/dev/null || true
+        sudo umount "$mnt/sys"    2>/dev/null || true
+        sudo umount "$mnt/dev/pts" 2>/dev/null || true
+        sudo umount "$mnt/dev"    2>/dev/null || true
+        sudo umount "$mnt"        2>/dev/null || true
+        rm -rf "$mnt"
+    }
+    trap _cleanup_exec EXIT INT TERM
+
+    sudo mount -o loop,offset="$root_offset" "$img" "$mnt"
+    sudo mount -o loop,offset="$boot_offset" "$img" "$mnt/boot"
+    sudo mount --bind /proc    "$mnt/proc"
+    sudo mount --bind /sys     "$mnt/sys"
+    sudo mount --bind /dev     "$mnt/dev"
+    sudo mount --bind /dev/pts "$mnt/dev/pts"
+
+    docker run --rm \
+        --platform linux/arm64 \
+        --privileged \
+        -v "$mnt:/rpi" \
+        -w /rpi \
+        ubuntu:24.04 \
+        chroot /rpi "$@"
+    local rc=$?
+
+    _cleanup_exec
+    trap - EXIT INT TERM
+    return $rc
+}
+
+# ── cmd: ssh (non-interactive or interactive QEMU SSH) ────────────────────────
+
+cmd_ssh() {
+    local pid_file running_pid=""
+    for pf in /tmp/rpi-*.pid; do
+        [[ -e "$pf" ]] || continue
+        local p; p=$(cat "$pf")
+        if kill -0 "$p" 2>/dev/null; then
+            running_pid="$p"
+            break
+        else
+            rm -f "$pf"
+        fi
+    done
+    [[ -n "$running_pid" ]] || die "No running QEMU instance. Start one with: rpi run"
+
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -p "$SSH_PORT" \
+        "$DEFAULT_USER@localhost" "$@"
+}
+
+# ── cmd: put (copy file into image) ──────────────────────────────────────────
+
+cmd_put() {
+    command -v fdisk &>/dev/null || die "fdisk not found"
+
+    local img src dst
+    if [[ $# -eq 3 ]]; then
+        img="$1"; src="$2"; dst="$3"
+        [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    elif [[ $# -eq 2 ]]; then
+        img=$(pick_image); src="$1"; dst="$2"
+    else
+        die "Usage: rpi put [image] <local_src> <remote_dst>"
+    fi
+
+    [[ -f "$img" ]] || die "Image not found: $img"
+    [[ -f "$src" ]] || die "Source file not found: $src"
+
+    local sector_size root_offset
+    sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
+    root_offset=$(fdisk -l "$img" | awk '/Linux/ {print $2 * '"$sector_size"'; exit}')
+
+    local mnt
+    mnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+
+    _cleanup_put() { sudo umount "$mnt" 2>/dev/null || true; rm -rf "$mnt"; }
+    trap _cleanup_put EXIT INT TERM
+
+    sudo mount -o loop,offset="$root_offset" "$img" "$mnt"
+    sudo mkdir -p "$(dirname "$mnt/$dst")"
+    sudo cp "$src" "$mnt/$dst"
+    info "put: $src → $dst  [$(basename "$img")]"
+
+    _cleanup_put
+    trap - EXIT INT TERM
+}
+
+# ── cmd: get (copy file out of image) ─────────────────────────────────────────
+
+cmd_get() {
+    command -v fdisk &>/dev/null || die "fdisk not found"
+
+    local img src dst
+    if [[ $# -eq 3 ]]; then
+        img="$1"; src="$2"; dst="$3"
+        [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    elif [[ $# -eq 2 ]]; then
+        img=$(pick_image); src="$1"; dst="$2"
+    else
+        die "Usage: rpi get [image] <remote_src> <local_dst>"
+    fi
+
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    local sector_size root_offset
+    sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
+    root_offset=$(fdisk -l "$img" | awk '/Linux/ {print $2 * '"$sector_size"'; exit}')
+
+    local mnt
+    mnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+
+    _cleanup_get() { sudo umount "$mnt" 2>/dev/null || true; rm -rf "$mnt"; }
+    trap _cleanup_get EXIT INT TERM
+
+    sudo mount -o loop,offset="$root_offset" "$img" "$mnt"
+    [[ -e "$mnt/$src" ]] || { _cleanup_get; trap - EXIT INT TERM; die "Not found in image: $src"; }
+    cp -r "$mnt/$src" "$dst"
+    info "get: $src → $dst  [$(basename "$img")]"
+
+    _cleanup_get
+    trap - EXIT INT TERM
+}
+
 # ── cmd: help ─────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -591,15 +788,19 @@ cmd_help() {
   rpi — Raspberry Pi image manager
 
   COMMANDS
-    rpi                   Interactive menu
-    rpi list              List local images and running VMs
-    rpi download          Download an official RPi OS image
-    rpi shell [image]     Instant arm64 shell via Docker (no apt needed)
-    rpi run [image]       Full QEMU boot + SSH (needs qemu-system-arm)
-    rpi flash [image]     Flash image (or qcow2) to an SD card
-    rpi stop [name]       Stop a running QEMU instance
-    rpi imager            Launch rpi-imager GUI
-    rpi help              This help text
+    rpi                          Interactive menu
+    rpi list                     List local images and running VMs
+    rpi download                 Download an official RPi OS image
+    rpi shell [image]            Instant arm64 shell via Docker (no apt needed)
+    rpi exec [image] <cmd...>    Run command non-interactively in image (Docker)
+    rpi put  [image] <src> <dst> Copy a file into an image
+    rpi get  [image] <src> <dst> Extract a file from an image
+    rpi run  [image]             Full QEMU boot + SSH (needs qemu-system-arm)
+    rpi ssh  [cmd...]            SSH to running QEMU VM (interactive or not)
+    rpi flash [image]            Flash image (or qcow2) to an SD card
+    rpi stop [name]              Stop a running QEMU instance
+    rpi imager                   Launch rpi-imager GUI
+    rpi help                     This help text
 
   PATHS
     Images:  $IMAGES_DIR
@@ -640,10 +841,14 @@ cmd_menu() {
         echo "║  [1] List images & instances     ║"
         echo "║  [2] Download image              ║"
         echo "║  [3] Shell into image (Docker)   ║"
-        echo "║  [4] Run image (full QEMU)       ║"
-        echo "║  [5] Flash image to SD card      ║"
-        echo "║  [6] Stop a running instance     ║"
-        echo "║  [7] Launch rpi-imager GUI       ║"
+        echo "║  [4] Exec command in image       ║"
+        echo "║  [5] Put file into image         ║"
+        echo "║  [6] Get file from image         ║"
+        echo "║  [7] Run image (full QEMU)       ║"
+        echo "║  [8] SSH to running VM           ║"
+        echo "║  [9] Flash image to SD card      ║"
+        echo "║  [0] Stop a running instance     ║"
+        echo "║  [i] Launch rpi-imager GUI       ║"
         echo "║  [Q] Quit                        ║"
         echo "╚══════════════════════════════════╝"
         echo ""
@@ -653,10 +858,14 @@ cmd_menu() {
             1) cmd_list ;;
             2) cmd_download ;;
             3) cmd_shell ;;
-            4) cmd_run ;;
-            5) cmd_flash ;;
-            6) cmd_stop ;;
-            7) cmd_imager ;;
+            4) read -rp "  Command: " _ecmd; cmd_exec $_ecmd ;;
+            5) read -rp "  Source: " _psrc; read -rp "  Dest in image: " _pdst; cmd_put "$_psrc" "$_pdst" ;;
+            6) read -rp "  Path in image: " _gsrc; read -rp "  Local dest: " _gdst; cmd_get "$_gsrc" "$_gdst" ;;
+            7) cmd_run ;;
+            8) cmd_ssh ;;
+            9) cmd_flash ;;
+            0) cmd_stop ;;
+            i) cmd_imager ;;
             q) echo "Bye."; exit 0 ;;
             *) echo "  Invalid choice." ;;
         esac
@@ -672,6 +881,10 @@ case "${1:-menu}" in
     download) cmd_download ;;
     run)      cmd_run "${2:-}" ;;
     shell)    cmd_shell "${2:-}" ;;
+    exec)     shift; cmd_exec "$@" ;;
+    ssh)      shift; cmd_ssh "$@" ;;
+    put)      shift; cmd_put "$@" ;;
+    get)      shift; cmd_get "$@" ;;
     flash)    cmd_flash ;;
     stop)     cmd_stop "${2:-}" ;;
     imager)   cmd_imager ;;
