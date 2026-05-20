@@ -47,7 +47,7 @@ _image_display_name() {
 # Format: key|display|qemu_bin|qemu_machine|cpu|ram|kernel|dtb
 # 32-bit (armhf image required): pi0, pi1aplus, pi2b
 # 64-bit (arm64 image required): pi3b, pi3bplus, pi3aplus, pi4b, pi5b
-# Pi 4B requires QEMU 9+; Pi 5B requires QEMU 10+.
+# Pi 4B requires QEMU 9+ (available in QEMU 11). Pi 5B not yet in any QEMU release.
 _MACHINE_TABLE=(
     "pi0|Pi Zero (512 MB)|qemu-system-arm|raspi0|arm1176|512M|kernel.img|bcm2708-rpi-zero.dtb"
     "pi1aplus|Pi 1 A+ (256 MB)|qemu-system-arm|raspi1ap|arm1176|256M|kernel.img|bcm2708-rpi-b-plus.dtb"
@@ -124,8 +124,11 @@ _pick_machine() {
         if _qemu_supports_machine "$bin" "$machine"; then
             note=""
             avail+=("1")
+        elif ! command -v "$bin" &>/dev/null; then
+            note="  [install qemu-system-arm]"
+            avail+=("0")
         else
-            note="  [needs QEMU 9+]"
+            note="  [not supported by installed QEMU]"
             avail+=("0")
         fi
         printf "  [%d] %-26s%s\n" "$i" "$disp" "$note" >&2
@@ -133,7 +136,7 @@ _pick_machine() {
         ((i++))
     done
     echo "" >&2
-    echo "  To unlock Pi 4/5: build QEMU 9+ from source (https://www.qemu.org/download/)" >&2
+    echo "  Pi 5 is not yet supported by any QEMU release. Check https://www.qemu.org/" >&2
     echo "  Or add custom models to: $CONFIGS_DIR/machines.conf" >&2
     echo "" >&2
     read -rp "Select [1-$((i-1))]: " sel
