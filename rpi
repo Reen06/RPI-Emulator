@@ -42,13 +42,24 @@ cmd_list() {
     echo ""
     echo "=== Running Instances ==="
     local running=0
+    local lan_ip; lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     for pid_file in /tmp/rpi-*.pid; do
         [[ -e "$pid_file" ]] || continue
         local pid name
         pid=$(cat "$pid_file")
         name=$(basename "$pid_file" .pid | sed 's/^rpi-//')
         if kill -0 "$pid" 2>/dev/null; then
-            info "$name  (pid $pid, ssh: localhost:$SSH_PORT)"
+            info "$name  (pid $pid)"
+            info "  SSH: ssh -p $SSH_PORT ${DEFAULT_USER}@${lan_ip:-localhost}"
+            local ports_file="$CONFIGS_DIR/${name}.ports"
+            if [[ -f "$ports_file" ]]; then
+                while IFS= read -r _line; do
+                    _line="${_line%%#*}"; _line="${_line// /}"
+                    [[ "$_line" =~ ^([0-9]+):([0-9]+)$ ]] || continue
+                    [[ "${BASH_REMATCH[1]}" == "$SSH_PORT" ]] && continue
+                    info "  http://${lan_ip:-localhost}:${BASH_REMATCH[1]}  →  guest:${BASH_REMATCH[2]}"
+                done < "$ports_file"
+            fi
             ((running++))
         else
             rm -f "$pid_file"
@@ -107,6 +118,10 @@ cmd_label() {
         mv "$old_disk" "$new_disk" && info "Renamed disk: $(basename "$old_disk") → $(basename "$new_disk")"
     [[ -d "$old_kdir" && "$old_kdir" != "$new_kdir" ]] && \
         mv "$old_kdir" "$new_kdir" && info "Renamed kernels: $(basename "$old_kdir") → $(basename "$new_kdir")"
+    local old_ports="$CONFIGS_DIR/${old_slug}.ports"
+    local new_ports="$CONFIGS_DIR/${new_label}.ports"
+    [[ -f "$old_ports" && "$old_ports" != "$new_ports" ]] && \
+        mv "$old_ports" "$new_ports" && info "Renamed ports config: $(basename "$old_ports") → $(basename "$new_ports")"
 }
 
 # ── cmd: download ─────────────────────────────────────────────────────────────
@@ -254,6 +269,36 @@ cmd_run() {
     local name; name=$(slug "$img")
     local disk="$DISKS_DIR/$name.qcow2"
     local kdir="$KERNELS_DIR/$name"
+    local extra_fwds; extra_fwds=$(_load_extra_hostfwds "$name")
+
+    # Machine selection — persisted in configs/<slug>.machine
+    local machine_file="$CONFIGS_DIR/${name}.machine"
+    local machine_key
+    if [[ -f "$machine_file" ]]; then
+        machine_key=$(cat "$machine_file")
+        _machine_prop "$machine_key" qemu &>/dev/null || {
+            info "Unknown machine '$machine_key', re-selecting..."
+            machine_key=$(_pick_machine)
+            echo "$machine_key" > "$machine_file"
+        }
+    else
+        machine_key=$(_pick_machine)
+        mkdir -p "$CONFIGS_DIR"
+        echo "$machine_key" > "$machine_file"
+    fi
+    local qemu_bin qemu_machine cpu ram kernel_file dtb_file
+    qemu_bin=$(_machine_prop "$machine_key" qemu_bin)
+    qemu_machine=$(_machine_prop "$machine_key" qemu)
+    cpu=$(_machine_prop "$machine_key" cpu)
+    ram=$(_machine_prop "$machine_key" ram)
+    kernel_file=$(_machine_prop "$machine_key" kernel)
+    dtb_file=$(_machine_prop "$machine_key" dtb)
+    command -v "$qemu_bin" &>/dev/null || die "$qemu_bin not found — install with: sudo apt install qemu-system-arm"
+    _qemu_supports_machine "$qemu_bin" "$qemu_machine" || \
+        die "$(_machine_prop "$machine_key" display) requires QEMU 9+. Build from source: https://www.qemu.org/download/ — or add a custom entry to $CONFIGS_DIR/machines.conf"
+
+    # Re-extract if the kernel or DTB for the selected machine is missing
+    { [[ -f "$kdir/$kernel_file" ]] && [[ -f "$kdir/$dtb_file" ]]; } || rm -rf "$kdir"
 
     echo ""
     echo "=== Preparing: $name ==="
@@ -266,25 +311,47 @@ cmd_run() {
         info "Using existing disk: $disk"
     fi
 
-    if [[ ! -f "$kdir/kernel8.img" ]]; then
-        info "Extracting kernel and DTB from boot partition..."
+    # QEMU raspi3b requires the virtual disk size to be a power of 2.
+    # Round up if needed (e.g. 6 GiB → 8 GiB).
+    local size_bytes pow2
+    size_bytes=$(qemu-img info --output=json "$disk" | jq '."virtual-size"')
+    if [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+        pow2=1073741824  # start at 1 GiB
+        while [[ $pow2 -lt $size_bytes ]]; do (( pow2 *= 2 )); done
+        if [[ $pow2 -gt $size_bytes ]]; then
+            local pow2_g=$(( pow2 / 1073741824 ))
+            qemu-img resize "$disk" "${pow2_g}G" >/dev/null
+            info "Resized disk to ${pow2_g}G (QEMU SD card power-of-2 requirement)"
+        fi
+    fi
+
+    if [[ ! -f "$kdir/$kernel_file" ]]; then
+        info "Extracting kernel and DTBs from boot partition..."
         mkdir -p "$kdir"
 
-        local sector_size offset
-        sector_size=$(fdisk -l "$img" | awk '/^Sector size/ {print $4}')
-        offset=$(fdisk -l "$img" | awk '/FAT/ || /W95 FAT/ || / b / {print $2 * '"$sector_size"'; exit}')
-
-        local mnt
+        local mnt loop_dev
         mnt=$(mktemp -d /tmp/rpi-boot.XXXXXX)
-        sudo mount -o loop,offset="$offset" "$img" "$mnt"
+        loop_dev=$(sudo losetup --find --show --partscan "$img") || die "losetup failed for $img"
+        sudo mount "${loop_dev}p1" "$mnt"
 
-        cp "$mnt/kernel8.img" "$kdir/" 2>/dev/null || { sudo umount "$mnt"; die "kernel8.img not found"; }
+        # Extract all kernels present (different Pi models need different ones)
+        for k in kernel.img kernel7.img kernel7l.img kernel8.img; do
+            [[ -f "$mnt/$k" ]] && cp "$mnt/$k" "$kdir/"
+        done
+        [[ -f "$kdir/$kernel_file" ]] || {
+            sudo umount "$mnt"; sudo losetup -d "$loop_dev"
+            die "$kernel_file not found — this image may not support $(_machine_prop "$machine_key" display). Try a 32-bit armhf image for Pi Zero/1/2."
+        }
 
-        local dtb_src
-        dtb_src=$(ls "$mnt"/bcm271*.dtb 2>/dev/null | head -1)
-        [[ -n "$dtb_src" ]] && cp "$dtb_src" "$kdir/rpi.dtb" || { sudo umount "$mnt"; die "No DTB file found"; }
+        # Extract all DTBs so any machine target is available without re-extraction
+        local dtb_count=0
+        for dtb_src in "$mnt"/bcm270*.dtb "$mnt"/bcm271*.dtb; do
+            [[ -f "$dtb_src" ]] && cp "$dtb_src" "$kdir/" && ((dtb_count++))
+        done
+        [[ $dtb_count -eq 0 ]] && { sudo umount "$mnt"; sudo losetup -d "$loop_dev"; die "No DTB files found in image"; }
+        [[ -f "$kdir/$dtb_file" ]] || { sudo umount "$mnt"; sudo losetup -d "$loop_dev"; die "DTB $dtb_file not found — image may not support this Pi model"; }
 
-        touch "$mnt/ssh"
+        sudo touch "$mnt/ssh"
 
         if [[ ! -f "$mnt/userconf.txt" ]]; then
             local hashed
@@ -294,6 +361,7 @@ cmd_run() {
         fi
 
         sudo umount "$mnt"
+        sudo losetup -d "$loop_dev"
         rm -rf "$mnt"
         info "Kernel and DTB extracted to $kdir/"
     fi
@@ -310,34 +378,34 @@ cmd_run() {
     fi
 
     echo ""
-    echo "=== Starting QEMU (raspi3b) ==="
+    echo "=== Starting QEMU ($(_machine_prop "$machine_key" display)) ==="
     info "SSH will be on localhost:$SSH_PORT"
     info "Login: $DEFAULT_USER / $DEFAULT_PASS"
     echo ""
 
-    qemu-system-aarch64 \
-        -M raspi3b \
-        -cpu cortex-a53 \
-        -m 1G \
-        -kernel "$kdir/kernel8.img" \
-        -dtb "$kdir/rpi.dtb" \
+    "$qemu_bin" \
+        -M "$qemu_machine" \
+        -cpu "$cpu" \
+        -m "$ram" \
+        -kernel "$kdir/$kernel_file" \
+        -dtb "$kdir/$dtb_file" \
         -drive file="$disk",format=qcow2 \
         -append "root=/dev/mmcblk0p2 rw rootfstype=ext4 console=ttyAMA0 loglevel=3 net.ifnames=0 dwc_otg.lpm_enable=0" \
-        -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
+        -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22${extra_fwds}" \
         -device usb-net,netdev=net0 \
         -nographic \
         -daemonize \
         -pidfile "$pid_file" 2>/dev/null || {
             echo "Running in foreground (Ctrl+A X to quit QEMU)..."
-            qemu-system-aarch64 \
-                -M raspi3b \
-                -cpu cortex-a53 \
-                -m 1G \
-                -kernel "$kdir/kernel8.img" \
-                -dtb "$kdir/rpi.dtb" \
+            "$qemu_bin" \
+                -M "$qemu_machine" \
+                -cpu "$cpu" \
+                -m "$ram" \
+                -kernel "$kdir/$kernel_file" \
+                -dtb "$kdir/$dtb_file" \
                 -drive file="$disk",format=qcow2 \
                 -append "root=/dev/mmcblk0p2 rw rootfstype=ext4 console=ttyAMA0 loglevel=3 net.ifnames=0" \
-                -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
+                -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22${extra_fwds}" \
                 -device usb-net,netdev=net0 \
                 -nographic
             return
@@ -659,6 +727,161 @@ cmd_get() {
     trap - EXIT INT TERM
 }
 
+# ── cmd: machine ──────────────────────────────────────────────────────────────
+
+cmd_machine() {
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    local name; name=$(slug "$img")
+    local machine_file="$CONFIGS_DIR/${name}.machine"
+    mkdir -p "$CONFIGS_DIR"
+
+    local current=""
+    [[ -f "$machine_file" ]] && current=$(cat "$machine_file")
+    if [[ -n "$current" ]]; then
+        info "Current target: $(_machine_prop "$current" display 2>/dev/null || echo "$current")"
+    else
+        info "No target set (will be prompted on next rpi run)"
+    fi
+
+    local new_key
+    new_key=$(_pick_machine)
+    echo "$new_key" > "$machine_file"
+    info "Set to: $(_machine_prop "$new_key" display)"
+
+    # Remove extracted kernels so the right DTB is pulled on next run
+    local kdir="$KERNELS_DIR/$name"
+    if [[ -d "$kdir" && ! -f "$kdir/$(_machine_prop "$new_key" dtb)" ]]; then
+        rm -rf "$kdir"
+        info "Cleared kernel cache (will re-extract DTB on next run)"
+    fi
+}
+
+# ── cmd: resize ───────────────────────────────────────────────────────────────
+
+cmd_resize() {
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    command -v parted    &>/dev/null || die "parted not found (sudo apt install parted)"
+    command -v resize2fs &>/dev/null || die "resize2fs not found (sudo apt install e2fsprogs)"
+
+    local name; name=$(slug "$img")
+    local current_size; current_size=$(du -sh "$img" | cut -f1)
+
+    echo ""
+    echo "=== Resize Image: $name ==="
+    info "Current size: $current_size"
+    echo ""
+    read -rp "  Add how many GB? [e.g. 4]: " add_gb
+    [[ "$add_gb" =~ ^[0-9]+$ && "$add_gb" -ge 1 ]] || die "Enter a whole number >= 1"
+
+    echo ""
+    info "Extending image file by ${add_gb}G..."
+    truncate -s "+${add_gb}G" "$img"
+
+    info "Resizing partition 2 to fill new space..."
+    sudo parted -s "$img" resizepart 2 100%
+
+    info "Attaching image..."
+    local loop_dev
+    loop_dev=$(sudo losetup --find --show --partscan "$img") || die "losetup failed"
+
+    info "Checking filesystem..."
+    sudo e2fsck -f -y "${loop_dev}p2" || true
+
+    info "Expanding filesystem..."
+    sudo resize2fs "${loop_dev}p2"
+
+    sudo losetup -d "$loop_dev"
+
+    # Invalidate any existing qcow2 so QEMU rebuilds it at the new size
+    local qcow2="$DISKS_DIR/${name}.qcow2"
+    if [[ -f "$qcow2" ]]; then
+        rm -f "$qcow2"
+        info "Removed stale qcow2 disk (will be rebuilt at new size on next rpi run)"
+    fi
+
+    local new_size; new_size=$(du -sh "$img" | cut -f1)
+    echo ""
+    info "Done. Image is now $new_size."
+}
+
+# ── cmd: ports ────────────────────────────────────────────────────────────────
+
+cmd_ports() {
+    local img="${1:-}"
+    [[ -z "$img" ]] && img=$(pick_image)
+    [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
+    [[ -f "$img" ]] || die "Image not found: $img"
+
+    local name; name=$(slug "$img")
+    local ports_file="$CONFIGS_DIR/${name}.ports"
+    mkdir -p "$CONFIGS_DIR"
+
+    while true; do
+        echo ""
+        echo "=== Port Forwards: $name ==="
+        local idx=1
+        if [[ -f "$ports_file" ]]; then
+            while IFS= read -r line; do
+                local stripped="${line%%#*}"; stripped="${stripped// /}"
+                [[ -z "$stripped" ]] && continue
+                printf "  [%d] %s\n" "$idx" "$stripped"
+                ((idx++))
+            done < "$ports_file"
+        fi
+        [[ $idx -eq 1 ]] && info "(none configured)"
+        echo ""
+        echo "  [a] Add    [r] Remove    [q] Done"
+        echo ""
+        read -rp "  Select: " choice
+
+        case "${choice,,}" in
+            a)
+                read -rp "  Host port  (on this machine, e.g. 8080): " hport
+                read -rp "  Guest port (inside the VM,  e.g. 80):   " gport
+                [[ "$hport" =~ ^[0-9]+$ && "$gport" =~ ^[0-9]+$ ]] || \
+                    { echo "  Invalid port number."; continue; }
+                [[ "$hport" -eq "$SSH_PORT" ]] && \
+                    { echo "  Port $SSH_PORT is reserved for SSH."; continue; }
+                [[ "$hport" -lt 1 || "$hport" -gt 65535 || "$gport" -lt 1 || "$gport" -gt 65535 ]] && \
+                    { echo "  Port out of range (1-65535)."; continue; }
+                grep -qE "^${hport}:" "$ports_file" 2>/dev/null && \
+                    { echo "  Host port $hport is already mapped."; continue; }
+                printf '%s:%s\n' "$hport" "$gport" >> "$ports_file"
+                info "Added: localhost:$hport  →  guest:$gport"
+                ;;
+            r)
+                [[ -f "$ports_file" ]] || { info "No forwards to remove."; continue; }
+                read -rp "  Host port to remove: " hport
+                [[ "$hport" =~ ^[0-9]+$ ]] || { echo "  Invalid."; continue; }
+                local new_lines=()
+                while IFS= read -r line; do
+                    local stripped="${line%%#*}"; stripped="${stripped// /}"
+                    if [[ "$stripped" =~ ^${hport}: ]]; then
+                        info "Removed: $stripped"
+                    else
+                        new_lines+=("$line")
+                    fi
+                done < "$ports_file"
+                if [[ ${#new_lines[@]} -gt 0 ]]; then
+                    printf '%s\n' "${new_lines[@]}" > "$ports_file"
+                else
+                    > "$ports_file"
+                fi
+                ;;
+            q) break ;;
+            *) echo "  Invalid choice." ;;
+        esac
+    done
+}
+
 # ── cmd: help ─────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -675,6 +898,9 @@ cmd_help() {
     rpi exec   [image] <cmd...>       Run command non-interactively in image
     rpi put    [image] <src> <dst>    Copy a file into an image
     rpi get    [image] <src> <dst>    Extract a file from an image
+    rpi resize [image]                Grow image root partition by N GB
+    rpi ports  [image]                Configure LAN port forwards for an image
+    rpi machine [image]               Change emulation target (Pi Zero / 1 / 2 / 3B / 3B+ / 3A+)
     rpi run    [image]                Full QEMU boot + SSH (needs qemu-system-arm)
     rpi ssh    [cmd...]               SSH to running QEMU VM (interactive or not)
     rpi flash  [image]                Flash image (or qcow2) to an SD card
@@ -735,9 +961,12 @@ cmd_menu() {
         echo "║  [6] Put file into image         ║"
         echo "║  [7] Get file from image         ║"
         echo "║  [8] Run image (full QEMU)       ║"
+        echo "║  [m] Change emulation target     ║"
         echo "║  [9] SSH to running VM           ║"
         echo "║  [0] Flash image to SD card      ║"
         echo "║  [s] Stop a running instance     ║"
+        echo "║  [z] Resize image                ║"
+        echo "║  [p] Port forwards               ║"
         echo "║  [i] Launch rpi-imager GUI       ║"
         echo "║  [Q] Quit                        ║"
         echo "╚══════════════════════════════════╝"
@@ -753,9 +982,12 @@ cmd_menu() {
             6) read -rp "  Source: " _psrc; read -rp "  Dest in image: " _pdst; cmd_put "$_psrc" "$_pdst" ;;
             7) read -rp "  Path in image: " _gsrc; read -rp "  Local dest: " _gdst; cmd_get "$_gsrc" "$_gdst" ;;
             8) cmd_run ;;
+            m) cmd_machine ;;
             9) cmd_ssh ;;
             0) cmd_flash ;;
             s) cmd_stop ;;
+            z) cmd_resize ;;
+            p) cmd_ports ;;
             i) cmd_imager ;;
             q) echo "Bye."; exit 0 ;;
             *) echo "  Invalid choice." ;;
@@ -771,6 +1003,7 @@ case "${1:-menu}" in
     list)     cmd_list ;;
     download) cmd_download ;;
     label)    shift; cmd_label "$@" ;;
+    machine)  cmd_machine "${2:-}" ;;
     run)      cmd_run "${2:-}" ;;
     shell)    cmd_shell "${2:-}" ;;
     exec)     shift; cmd_exec "$@" ;;
@@ -778,6 +1011,8 @@ case "${1:-menu}" in
     put)      shift; cmd_put "$@" ;;
     get)      shift; cmd_get "$@" ;;
     flash)    cmd_flash ;;
+    resize)   cmd_resize "${2:-}" ;;
+    ports)    cmd_ports "${2:-}" ;;
     stop)     cmd_stop "${2:-}" ;;
     imager)   cmd_imager ;;
     help|--help|-h) cmd_help ;;
