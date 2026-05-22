@@ -236,10 +236,21 @@ cmd_download() {
     fi
 
     echo ""
-    read -rp "Customize this image now (set user/password/SSH/etc.)? [y/N]: " do_customize
-    if [[ "$do_customize" =~ ^[Yy]$ ]]; then
-        cmd_shell "$final_img"
-    fi
+    echo "=== Set login credentials ==="
+    local cred_user cred_pass cred_pass2
+    read -rp "  Username [pi]: " cred_user
+    [[ -z "$cred_user" ]] && cred_user="pi"
+    while true; do
+        read -rsp "  Password [raspberry]: " cred_pass; echo ""
+        [[ -z "$cred_pass" ]] && cred_pass="raspberry" && break
+        read -rsp "  Confirm password: " cred_pass2; echo ""
+        [[ "$cred_pass" == "$cred_pass2" ]] && break
+        echo "  Passwords do not match, try again."
+    done
+    local cred_slug; cred_slug=$(slug "$final_img")
+    mkdir -p "$CONFIGS_DIR"
+    printf 'USER=%s\nPASS=%s\n' "$cred_user" "$cred_pass" > "$CONFIGS_DIR/${cred_slug}.creds"
+    info "Credentials saved: $cred_user / (password set)"
 }
 
 # ── cmd: shell (Docker-based, no apt needed) ──────────────────────────────────
@@ -302,6 +313,16 @@ cmd_run() {
     local kdir="$KERNELS_DIR/$name"
     local extra_fwds; extra_fwds=$(_load_extra_hostfwds "$name")
 
+    # Load per-image credentials (set during download; fall back to defaults)
+    local creds_file="$CONFIGS_DIR/${name}.creds"
+    if [[ -f "$creds_file" ]]; then
+        local _u _p
+        _u=$(grep '^USER=' "$creds_file" | cut -d= -f2-)
+        _p=$(grep '^PASS=' "$creds_file" | cut -d= -f2-)
+        [[ -n "$_u" ]] && DEFAULT_USER="$_u"
+        [[ -n "$_p" ]] && DEFAULT_PASS="$_p"
+    fi
+
     # Machine selection — persisted in configs/<slug>.machine
     local machine_file="$CONFIGS_DIR/${name}.machine"
     local machine_key
@@ -333,6 +354,14 @@ cmd_run() {
     local need_initrd=0
     [[ "$qemu_machine" == "raspi4b" ]] && need_initrd=1
     { [[ -f "$kdir/$kernel_file" ]] && [[ -f "$kdir/$dtb_file" ]] && { [[ $need_initrd -eq 0 ]] || [[ -f "$kdir/initrd" ]]; }; } || rm -rf "$kdir"
+
+    # For Pi 4B: rebuild initrd if credentials changed since last build
+    if [[ "$qemu_machine" == "raspi4b" && -f "$kdir/initrd" && -f "$creds_file" ]]; then
+        if [[ "$creds_file" -nt "$kdir/initrd" ]]; then
+            info "Credentials updated — rebuilding initrd..."
+            _pi4b_build_initrd "$kdir" "$DEFAULT_USER" "$DEFAULT_PASS" && info "Rebuilt Pi 4B initrd with new credentials"
+        fi
+    fi
 
     echo ""
     echo "=== Preparing: $name ==="
@@ -391,12 +420,10 @@ cmd_run() {
 
         sudo touch "$mnt/ssh"
 
-        if [[ ! -f "$mnt/userconf.txt" ]]; then
-            local hashed
-            hashed=$(echo "$DEFAULT_PASS" | openssl passwd -6 -stdin)
-            echo "${DEFAULT_USER}:${hashed}" | sudo tee "$mnt/userconf.txt" >/dev/null
-            info "Created user: $DEFAULT_USER / $DEFAULT_PASS"
-        fi
+        local hashed
+        hashed=$(echo "$DEFAULT_PASS" | openssl passwd -6 -stdin)
+        echo "${DEFAULT_USER}:${hashed}" | sudo tee "$mnt/userconf.txt" >/dev/null
+        info "Created user: $DEFAULT_USER / $DEFAULT_PASS"
 
         # Pi 4B: extract initrd from boot partition for patching
         if [[ "$qemu_machine" == "raspi4b" ]]; then
@@ -417,7 +444,7 @@ cmd_run() {
         # Pi 4B post-extraction: patch DTB for USB OTG and build custom initrd
         if [[ "$qemu_machine" == "raspi4b" ]]; then
             _pi4b_patch_dtb "$kdir/$dtb_file" && info "Patched DTB: USB OTG enabled"
-            _pi4b_build_initrd "$kdir" && info "Built Pi 4B initrd"
+            _pi4b_build_initrd "$kdir" "$DEFAULT_USER" "$DEFAULT_PASS" && info "Built Pi 4B initrd"
         fi
     fi
 
@@ -1059,6 +1086,66 @@ cmd_ports() {
     done
 }
 
+# ── cmd: delete ───────────────────────────────────────────────────────────────
+
+cmd_delete() {
+    local images=()
+    local labels=()
+    while IFS= read -r f; do
+        images+=("$f")
+        labels+=("$(_image_display_name "$f")")
+    done < <(ls "$IMAGES_DIR"/*.img 2>/dev/null)
+
+    if [[ ${#images[@]} -eq 0 ]]; then
+        info "No images found."
+        return
+    fi
+
+    echo ""
+    echo "Installed images:"
+    local i=1
+    for lbl in "${labels[@]}"; do
+        printf "  [%d] %s\n" "$i" "$lbl"
+        i=$((i + 1))
+    done
+    echo "  [a] Delete ALL"
+    echo ""
+    read -rp "Select image to delete [1-$((i-1)) or a]: " sel
+
+    local targets=()
+    if [[ "${sel,,}" == "a" ]]; then
+        targets=("${images[@]}")
+    elif [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le $((i-1)) ]]; then
+        targets=("${images[$((sel-1))]}")
+    else
+        echo "  Cancelled."
+        return
+    fi
+
+    echo ""
+    for img in "${targets[@]}"; do
+        local n; n=$(slug "$img")
+        read -rp "  Delete '$(_image_display_name "$img")' and all associated data? [y/N]: " confirm
+        [[ "${confirm,,}" == "y" ]] || { echo "  Skipped."; continue; }
+
+        # Stop running VM if any
+        local pid_file="/tmp/rpi-${n}.pid"
+        if [[ -f "$pid_file" ]]; then
+            local pid; pid=$(cat "$pid_file")
+            kill "$pid" 2>/dev/null && info "Stopped running VM: $n"
+            rm -f "$pid_file"
+        fi
+
+        rm -f "$img"
+        rm -f "$DISKS_DIR/${n}.qcow2"
+        rm -rf "$KERNELS_DIR/${n}"
+        rm -f "$CONFIGS_DIR/${n}.machine"
+        rm -f "$CONFIGS_DIR/${n}.ports"
+        rm -f "$CONFIGS_DIR/${n}.creds"
+        info "Deleted: $n"
+    done
+}
+
 # ── cmd: help ─────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1080,6 +1167,7 @@ cmd_help() {
     rpi machine [image]               Change emulation target (Pi Zero / 1 / 2 / 3B / 3B+ / 3A+)
     rpi run    [-v] [image]            Full QEMU boot + SSH (needs qemu-system-arm)
                                         -v / --verbose  show serial output during boot
+    rpi delete [image]                Delete an image and all associated data
     rpi ssh    [cmd...]               SSH to running QEMU VM (interactive or not)
     rpi flash  [image]                Flash image (or qcow2) to an SD card
     rpi stop   [name]                 Stop a running QEMU instance
@@ -1150,6 +1238,7 @@ cmd_menu() {
         echo "║  [z] Resize image                ║"
         echo "║  [p] Port forwards               ║"
         echo "║  [i] Launch rpi-imager GUI       ║"
+        echo "║  [x] Delete an image             ║"
         echo "║  [Q] Quit                        ║"
         echo "╚══════════════════════════════════╝"
         echo ""
@@ -1172,6 +1261,7 @@ cmd_menu() {
             z) cmd_resize ;;
             p) cmd_ports ;;
             i) cmd_imager ;;
+            x) cmd_delete ;;
             q) echo "Bye."; exit 0 ;;
             *) echo "  Invalid choice." ;;
         esac
@@ -1198,6 +1288,7 @@ case "${1:-menu}" in
     ports)    cmd_ports "${2:-}" ;;
     stop)     cmd_stop "${2:-}" ;;
     imager)   cmd_imager ;;
+    delete)   cmd_delete ;;
     help|--help|-h) cmd_help ;;
     menu|*)   cmd_menu ;;
 esac

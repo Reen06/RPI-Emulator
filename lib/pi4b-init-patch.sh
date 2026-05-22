@@ -331,38 +331,55 @@ unset forcefsck
 unset fsckfix
 unset starttime
 
+# Credentials injected at initrd build time
+RPI_USER='__RPI_USERNAME__'
+RPI_HASH='__RPI_PASS_HASH__'
+
 # Unlock root account so sulogin works in rescue mode (root is locked in Raspbian by default)
 if [ -f "${rootmnt}/etc/shadow" ]; then
     sed -i 's/^root:[^:]*/root:/' "${rootmnt}/etc/shadow" || true
 fi
 
-# Ensure pi user exists with /bin/bash shell and known password (raspberry) for SSH access
+# Set up the target user
 if [ -f "${rootmnt}/etc/passwd" ]; then
-    if grep -q "^pi:" "${rootmnt}/etc/passwd"; then
-        # Fix shell in case it's nologin or false
-        sed -i '/^pi:/ s|:[^:]*$|:/bin/bash|' "${rootmnt}/etc/passwd"
+    if grep -q "^${RPI_USER}:" "${rootmnt}/etc/passwd"; then
+        # User exists — ensure login shell is bash
+        sed -i "/^${RPI_USER}:/ s|:[^:]*\$|:/bin/bash|" "${rootmnt}/etc/passwd"
+    elif grep -q "^pi:" "${rootmnt}/etc/passwd"; then
+        # Rename existing pi user to RPI_USER
+        sed -i "s|^pi:|${RPI_USER}:|" "${rootmnt}/etc/passwd"
+        sed -i "s|/home/pi:|/home/${RPI_USER}:|" "${rootmnt}/etc/passwd"
+        sed -i "s|^pi:|${RPI_USER}:|" "${rootmnt}/etc/group" 2>/dev/null || true
+        [ -d "${rootmnt}/home/pi" ] && mv "${rootmnt}/home/pi" "${rootmnt}/home/${RPI_USER}" 2>/dev/null || true
     else
-        echo 'pi:x:1000:1000:,,,:/home/pi:/bin/bash' >> "${rootmnt}/etc/passwd"
-        echo 'pi:x:1000:' >> "${rootmnt}/etc/group" 2>/dev/null || true
+        echo "${RPI_USER}:x:1000:1000:,,,:/home/${RPI_USER}:/bin/bash" >> "${rootmnt}/etc/passwd"
+        echo "${RPI_USER}:x:1000:" >> "${rootmnt}/etc/group" 2>/dev/null || true
     fi
 fi
+
+# Set password
 if [ -f "${rootmnt}/etc/shadow" ]; then
-    PASS_HASH='$6$qlC7jdlXY95qaCDL$2CInWIGRKLqr5t9JhhyfTysrIBWC1UVND0Gc5TesNCtECAIoivJuu/CVaznABMEgDmtG.r6XCGtw7EzhqeWLt0'
-    sed -i "s|^pi:[^:]*|pi:${PASS_HASH}|" "${rootmnt}/etc/shadow" || true
-    # If pi not in shadow, add it
-    if ! grep -q "^pi:" "${rootmnt}/etc/shadow"; then
-        echo "pi:${PASS_HASH}:0:0:99999:7:::" >> "${rootmnt}/etc/shadow"
+    # Rename pi shadow entry if we renamed the user
+    if [ "${RPI_USER}" != "pi" ]; then
+        sed -i "s|^pi:|${RPI_USER}:|" "${rootmnt}/etc/shadow" 2>/dev/null || true
+    fi
+    sed -i "s|^${RPI_USER}:[^:]*|${RPI_USER}:${RPI_HASH}|" "${rootmnt}/etc/shadow" || true
+    if ! grep -q "^${RPI_USER}:" "${rootmnt}/etc/shadow"; then
+        echo "${RPI_USER}:${RPI_HASH}:0:0:99999:7:::" >> "${rootmnt}/etc/shadow"
     fi
 fi
-# Ensure the pi user has a .bashrc with color prompt enabled
-if [ ! -f "${rootmnt}/home/pi/.bashrc" ] && [ -f "${rootmnt}/etc/skel/.bashrc" ]; then
-    cp "${rootmnt}/etc/skel/.bashrc" "${rootmnt}/home/pi/.bashrc"
-    chown 1000:1000 "${rootmnt}/home/pi/.bashrc" 2>/dev/null || true
+
+# Ensure the user has a .bashrc with color prompt enabled
+if [ ! -f "${rootmnt}/home/${RPI_USER}/.bashrc" ]; then
+    mkdir -p "${rootmnt}/home/${RPI_USER}"
+    [ -f "${rootmnt}/etc/skel/.bashrc" ] && \
+        cp "${rootmnt}/etc/skel/.bashrc" "${rootmnt}/home/${RPI_USER}/.bashrc"
+    chown 1000:1000 "${rootmnt}/home/${RPI_USER}/.bashrc" 2>/dev/null || true
 fi
-if [ -f "${rootmnt}/home/pi/.bashrc" ]; then
-    sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' "${rootmnt}/home/pi/.bashrc" || true
-    grep -q "^force_color_prompt=yes" "${rootmnt}/home/pi/.bashrc" || \
-        printf '\nforce_color_prompt=yes\n' >> "${rootmnt}/home/pi/.bashrc"
+if [ -f "${rootmnt}/home/${RPI_USER}/.bashrc" ]; then
+    sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' "${rootmnt}/home/${RPI_USER}/.bashrc" || true
+    grep -q "^force_color_prompt=yes" "${rootmnt}/home/${RPI_USER}/.bashrc" || \
+        printf '\nforce_color_prompt=yes\n' >> "${rootmnt}/home/${RPI_USER}/.bashrc"
 fi
 
 # Allow password auth for SSH - set PermitRootLogin and PasswordAuthentication

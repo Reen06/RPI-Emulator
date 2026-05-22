@@ -177,16 +177,18 @@ PYEOF
 # script with our patched version, and writes $kdir/initrd.
 _pi4b_build_initrd() {
     local kdir="$1"
+    local username="${2:-pi}"
+    local password="${3:-raspberry}"
     local orig="$kdir/initrd.orig"
     local init_patch="$LIB_DIR/pi4b-init-patch.sh"
 
     [[ -f "$orig" ]] || { echo "  Warning: no initrd.orig found; Pi 4B networking may not work" >&2; return 1; }
     [[ -f "$init_patch" ]] || { echo "  Warning: pi4b-init-patch.sh not found in lib/" >&2; return 1; }
 
-    python3 - "$orig" "$init_patch" "$kdir/initrd" <<'PYEOF' || return 1
+    python3 - "$orig" "$init_patch" "$kdir/initrd" "$username" "$password" <<'PYEOF' || return 1
 import sys, os, subprocess, shutil, tempfile
 
-orig, init_patch, out = sys.argv[1], sys.argv[2], sys.argv[3]
+orig, init_patch, out, username, password = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 
 data = open(orig, 'rb').read()
@@ -215,8 +217,20 @@ try:
         subprocess.run(['cpio', '-id', '--quiet'], stdin=f, cwd=root,
                        capture_output=True)
 
-    # Patch init script
-    shutil.copy2(init_patch, os.path.join(root, 'init'))
+    # Generate password hash and patch init script with credentials
+    res = subprocess.run(['openssl', 'passwd', '-6', '-stdin'],
+                        input=password.encode(), capture_output=True)
+    if res.returncode != 0:
+        print(f'openssl passwd failed: {res.stderr.decode()[:200]}', file=sys.stderr)
+        sys.exit(1)
+    pass_hash = res.stdout.decode().strip()
+
+    with open(init_patch) as f:
+        init_content = f.read()
+    init_content = init_content.replace('__RPI_USERNAME__', username)
+    init_content = init_content.replace('__RPI_PASS_HASH__', pass_hash)
+    with open(os.path.join(root, 'init'), 'w') as f:
+        f.write(init_content)
     os.chmod(os.path.join(root, 'init'), 0o755)
 
     # Patch rpi_wd watchdog script: writing 'V' to /dev/watchdog0 causes
