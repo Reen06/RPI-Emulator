@@ -108,20 +108,28 @@ cmd_label() {
     mv "$img" "$new_path"
     info "Labelled: $(basename "$img") → $new_filename"
 
-    # Rename associated disk/kernel dir if they exist
+    # Rename associated disk/kernel dir/configs if they exist
     local old_disk="$DISKS_DIR/${old_slug}.qcow2"
     local new_disk="$DISKS_DIR/${new_label}.qcow2"
     local old_kdir="$KERNELS_DIR/${old_slug}"
     local new_kdir="$KERNELS_DIR/${new_label}"
 
-    [[ -f "$old_disk" && "$old_disk" != "$new_disk" ]] && \
-        mv "$old_disk" "$new_disk" && info "Renamed disk: $(basename "$old_disk") → $(basename "$new_disk")"
-    [[ -d "$old_kdir" && "$old_kdir" != "$new_kdir" ]] && \
-        mv "$old_kdir" "$new_kdir" && info "Renamed kernels: $(basename "$old_kdir") → $(basename "$new_kdir")"
-    local old_ports="$CONFIGS_DIR/${old_slug}.ports"
-    local new_ports="$CONFIGS_DIR/${new_label}.ports"
-    [[ -f "$old_ports" && "$old_ports" != "$new_ports" ]] && \
-        mv "$old_ports" "$new_ports" && info "Renamed ports config: $(basename "$old_ports") → $(basename "$new_ports")"
+    if [[ -f "$old_disk" && "$old_disk" != "$new_disk" ]]; then
+        mv "$old_disk" "$new_disk"
+        info "Renamed disk: $(basename "$old_disk") → $(basename "$new_disk")"
+    fi
+    if [[ -d "$old_kdir" && "$old_kdir" != "$new_kdir" ]]; then
+        mv "$old_kdir" "$new_kdir"
+        info "Renamed kernels: $(basename "$old_kdir") → $(basename "$new_kdir")"
+    fi
+    for _ext in ports machine creds; do
+        local _old="$CONFIGS_DIR/${old_slug}.${_ext}"
+        local _new="$CONFIGS_DIR/${new_label}.${_ext}"
+        if [[ -f "$_old" && "$_old" != "$_new" ]]; then
+            mv "$_old" "$_new"
+            info "Renamed config: $(basename "$_old") → $(basename "$_new")"
+        fi
+    done
 }
 
 # ── cmd: download ─────────────────────────────────────────────────────────────
@@ -366,28 +374,6 @@ cmd_run() {
     echo ""
     echo "=== Preparing: $name ==="
 
-    if [[ ! -f "$disk" ]]; then
-        info "Converting to qcow2 (first run only)..."
-        qemu-img convert -f raw -O qcow2 "$img" "$disk"
-        info "Disk: $disk"
-    else
-        info "Using existing disk: $disk"
-    fi
-
-    # QEMU raspi3b requires the virtual disk size to be a power of 2.
-    # Round up if needed (e.g. 6 GiB → 8 GiB).
-    local size_bytes pow2
-    size_bytes=$(qemu-img info --output=json "$disk" | jq '."virtual-size"')
-    if [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
-        pow2=1073741824  # start at 1 GiB
-        while [[ $pow2 -lt $size_bytes ]]; do (( pow2 *= 2 )); done
-        if [[ $pow2 -gt $size_bytes ]]; then
-            local pow2_g=$(( pow2 / 1073741824 ))
-            qemu-img resize "$disk" "${pow2_g}G" >/dev/null
-            info "Resized disk to ${pow2_g}G (QEMU SD card power-of-2 requirement)"
-        fi
-    fi
-
     if [[ ! -f "$kdir/$kernel_file" ]]; then
         info "Extracting kernel and DTBs from boot partition..."
         mkdir -p "$kdir"
@@ -437,6 +423,40 @@ cmd_run() {
         fi
 
         sudo umount "$mnt"
+
+        # Pre-configure root partition: SSH host keys + password auth config + entropy seed.
+        # Done here on the img before qemu-img convert so the qcow2 has it baked in.
+        # Pi 4B handles SSH keys via initrd; apply to all machines anyway (harmless to re-do).
+        local rmnt
+        rmnt=$(mktemp -d /tmp/rpi-root.XXXXXX)
+        if sudo mount "${loop_dev}p2" "$rmnt" 2>/dev/null; then
+            # SSH host keys — avoids entropy hang on first boot inside QEMU
+            if [[ -d "$rmnt/etc/ssh" ]]; then
+                sudo mkdir -p "$rmnt/etc/ssh/sshd_config.d"
+                printf 'PasswordAuthentication yes\nPermitRootLogin yes\n' | \
+                    sudo tee "$rmnt/etc/ssh/sshd_config.d/99-qemu.conf" >/dev/null
+                for _kt in rsa ecdsa ed25519; do
+                    local _kf="/tmp/rpi-hostkey-$$-${_kt}"
+                    ssh-keygen -q -N "" -t "$_kt" -f "$_kf" 2>/dev/null || continue
+                    sudo mv "$_kf"     "$rmnt/etc/ssh/ssh_host_${_kt}_key"
+                    sudo mv "$_kf.pub" "$rmnt/etc/ssh/ssh_host_${_kt}_key.pub"
+                    sudo chown root:root "$rmnt/etc/ssh/ssh_host_${_kt}_key" \
+                                         "$rmnt/etc/ssh/ssh_host_${_kt}_key.pub" 2>/dev/null || true
+                    sudo chmod 600 "$rmnt/etc/ssh/ssh_host_${_kt}_key"
+                    sudo chmod 644 "$rmnt/etc/ssh/ssh_host_${_kt}_key.pub"
+                done
+                info "Pre-generated SSH host keys"
+            fi
+            # Seed entropy file so systemd-random-seed has something on first boot
+            if [[ -d "$rmnt/var/lib/systemd" ]]; then
+                dd if=/dev/urandom bs=512 count=1 2>/dev/null | \
+                    sudo tee "$rmnt/var/lib/systemd/random-seed" >/dev/null
+                sudo chmod 600 "$rmnt/var/lib/systemd/random-seed" 2>/dev/null || true
+            fi
+            sudo umount "$rmnt"
+        fi
+        rm -rf "$rmnt"
+
         sudo losetup -d "$loop_dev"
         rm -rf "$mnt"
         info "Kernel and DTB extracted to $kdir/"
@@ -445,6 +465,28 @@ cmd_run() {
         if [[ "$qemu_machine" == "raspi4b" ]]; then
             _pi4b_patch_dtb "$kdir/$dtb_file" && info "Patched DTB: USB OTG enabled"
             _pi4b_build_initrd "$kdir" "$DEFAULT_USER" "$DEFAULT_PASS" && info "Built Pi 4B initrd"
+        fi
+    fi
+
+    if [[ ! -f "$disk" ]]; then
+        info "Converting to qcow2 (first run only)..."
+        qemu-img convert -f raw -O qcow2 "$img" "$disk"
+        info "Disk: $disk"
+    else
+        info "Using existing disk: $disk"
+    fi
+
+    # QEMU raspi3b requires the virtual disk size to be a power of 2.
+    # Round up if needed (e.g. 6 GiB → 8 GiB).
+    local size_bytes pow2
+    size_bytes=$(qemu-img info --output=json "$disk" | jq '."virtual-size"')
+    if [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+        pow2=1073741824  # start at 1 GiB
+        while [[ $pow2 -lt $size_bytes ]]; do (( pow2 *= 2 )); done
+        if [[ $pow2 -gt $size_bytes ]]; then
+            local pow2_g=$(( pow2 / 1073741824 ))
+            qemu-img resize "$disk" "${pow2_g}G" >/dev/null
+            info "Resized disk to ${pow2_g}G (QEMU SD card power-of-2 requirement)"
         fi
     fi
 
