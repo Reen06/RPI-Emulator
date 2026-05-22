@@ -55,7 +55,7 @@ _MACHINE_TABLE=(
     "pi3b|Pi 3B (1 GB)|qemu-system-aarch64|raspi3b|cortex-a53|1G|kernel8.img|bcm2710-rpi-3-b.dtb"
     "pi3bplus|Pi 3B+ (1 GB)|qemu-system-aarch64|raspi3b|cortex-a53|1G|kernel8.img|bcm2710-rpi-3-b-plus.dtb"
     "pi3aplus|Pi 3A+ (512 MB)|qemu-system-aarch64|raspi3ap|cortex-a53|512M|kernel8.img|bcm2710-rpi-3-b-plus.dtb"
-    "pi4b|Pi 4B (4 GB)|qemu-system-aarch64|raspi4b|cortex-a72|4G|kernel8.img|bcm2711-rpi-4-b.dtb"
+    "pi4b|Pi 4B (2 GB)|qemu-system-aarch64|raspi4b|cortex-a72|2G|kernel8.img|bcm2711-rpi-4-b.dtb"
     "pi5b|Pi 5B (4 GB)|qemu-system-aarch64|raspi5b|cortex-a76|4G|kernel_2712.img|bcm2712-rpi-5-b.dtb"
 )
 
@@ -144,6 +144,110 @@ _pick_machine() {
     [[ "${avail[$((sel-1))]}" == "0" ]] && \
         die "$(_machine_prop "${keys[$((sel-1))]}" display) is not supported by the installed QEMU ($(qemu-system-aarch64 --version 2>/dev/null | head -1)). QEMU 9+ required."
     echo "${keys[$((sel-1))]}"
+}
+
+# Pi 4B: patch DTB to enable the DWC2 USB OTG controller (disabled in stock DTB).
+# QEMU usb-net requires this to appear as usb0 in the guest.
+_pi4b_patch_dtb() {
+    local dtb="$1"
+    python3 - "$dtb" <<'PYEOF' 2>/dev/null || return 1
+import sys
+try:
+    import fdt
+except ImportError:
+    sys.exit(0)
+with open(sys.argv[1], 'rb') as f:
+    dt = fdt.parse_dtb(f.read())
+usb = dt.get_node('/soc/usb@7e980000')
+if usb is None:
+    sys.exit(0)
+patched = False
+for prop in usb.props:
+    if prop.name == 'status' and prop.data != ['okay']:
+        prop.data = ['okay']
+        patched = True
+if patched:
+    with open(sys.argv[1], 'wb') as f:
+        f.write(dt.to_dtb())
+PYEOF
+}
+
+# Pi 4B: build the custom initrd that fixes first-boot user setup for QEMU.
+# Takes the original initrd from $kdir/initrd.orig, replaces the main init
+# script with our patched version, and writes $kdir/initrd.
+_pi4b_build_initrd() {
+    local kdir="$1"
+    local orig="$kdir/initrd.orig"
+    local init_patch="$LIB_DIR/pi4b-init-patch.sh"
+
+    [[ -f "$orig" ]] || { echo "  Warning: no initrd.orig found; Pi 4B networking may not work" >&2; return 1; }
+    [[ -f "$init_patch" ]] || { echo "  Warning: pi4b-init-patch.sh not found in lib/" >&2; return 1; }
+
+    python3 - "$orig" "$init_patch" "$kdir/initrd" <<'PYEOF' || return 1
+import sys, os, subprocess, shutil, tempfile
+
+orig, init_patch, out = sys.argv[1], sys.argv[2], sys.argv[3]
+ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
+
+data = open(orig, 'rb').read()
+split_at = data.find(ZSTD_MAGIC)
+if split_at < 0:
+    # No zstd magic — whole file is a single cpio; treat as main part
+    split_at = 0
+    header = b''
+else:
+    header = data[:split_at]
+
+work = tempfile.mkdtemp(prefix='rpi-initrd.')
+try:
+    # Decompress main initramfs
+    main_cpio = os.path.join(work, 'main.cpio')
+    res = subprocess.run(['zstd', '-d', '-q', '-f', '-o', main_cpio],
+                         input=data[split_at:], capture_output=True)
+    if res.returncode != 0:
+        print(f'zstd decompress failed: {res.stderr.decode()[:200]}', file=sys.stderr)
+        sys.exit(1)
+
+    # Extract cpio
+    root = os.path.join(work, 'root')
+    os.makedirs(root)
+    with open(main_cpio, 'rb') as f:
+        subprocess.run(['cpio', '-id', '--quiet'], stdin=f, cwd=root,
+                       capture_output=True)
+
+    # Patch init script
+    shutil.copy2(init_patch, os.path.join(root, 'init'))
+    os.chmod(os.path.join(root, 'init'), 0o755)
+
+    # Patch rpi_wd watchdog script: writing 'V' to /dev/watchdog0 causes
+    # an immediate reboot in QEMU 11's bcm2835 watchdog emulation.
+    wd_script = os.path.join(root, 'scripts', 'init-top', 'rpi_wd')
+    if os.path.exists(wd_script):
+        with open(wd_script, 'w') as f:
+            f.write('#!/bin/sh\n# Skip: /dev/watchdog0 write causes immediate reboot in QEMU 11\ncase "${1}" in\n  prereqs) echo "udev"; exit 0 ;;\nesac\nexit 0\n')
+        os.chmod(wd_script, 0o755)
+
+    # Repack cpio | zstd
+    new_zst = os.path.join(work, 'new.zst')
+    files = sorted(subprocess.check_output(['find', '.'], cwd=root).decode().splitlines())
+    ls_proc = subprocess.Popen(['find', '.'], cwd=root, stdout=subprocess.PIPE)
+    sort_proc = subprocess.Popen(['sort'], stdin=ls_proc.stdout, stdout=subprocess.PIPE)
+    ls_proc.stdout.close()
+    cpio_proc = subprocess.Popen(['cpio', '-H', 'newc', '-o', '--quiet'],
+                                  stdin=sort_proc.stdout, stdout=subprocess.PIPE, cwd=root)
+    sort_proc.stdout.close()
+    zstd_proc = subprocess.Popen(['zstd', '-19', '-q', '-f', '-o', new_zst],
+                                  stdin=cpio_proc.stdout)
+    cpio_proc.stdout.close()
+    zstd_proc.wait()
+
+    # Assemble output
+    with open(out, 'wb') as f:
+        f.write(header)
+        f.write(open(new_zst, 'rb').read())
+finally:
+    shutil.rmtree(work, ignore_errors=True)
+PYEOF
 }
 
 # Read $CONFIGS_DIR/<slug>.ports and echo a comma-prefixed hostfwd fragment.
