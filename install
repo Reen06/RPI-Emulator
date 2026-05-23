@@ -4,25 +4,132 @@ set -euo pipefail
 RPI_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
 
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+ok()   { echo -e "  ${GREEN}✓${NC}  $*"; }
+warn() { echo -e "  ${YELLOW}!${NC}  $*"; }
+info() { echo -e "  ${NC}   $*"; }
+
+# ── 1. Symlinks ───────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== Linking scripts ==="
 mkdir -p "$INSTALL_DIR"
 
 for script in rpi rpi-wifi rpi-bluetooth; do
     target="$RPI_HOME/$script"
     link="$INSTALL_DIR/$script"
     if [[ ! -f "$target" ]]; then
-        echo "WARNING: $target not found, skipping"
+        warn "$target not found, skipping"
         continue
     fi
     chmod +x "$target"
     ln -sf "$target" "$link"
-    echo "  Linked: $link -> $target"
+    ok "Linked $script"
 done
 
-if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
-    echo ""
-    echo "NOTE: Add ~/.local/bin to your PATH:"
-    echo '  export PATH="$HOME/.local/bin:$PATH"'
-fi
+# ── 2. PATH ───────────────────────────────────────────────────────────────────
 
 echo ""
-echo "Installation complete. Run: rpi help"
+echo "=== PATH ==="
+if echo "$PATH" | grep -q "$INSTALL_DIR"; then
+    ok "~/.local/bin already in PATH"
+else
+    SHELL_RC=""
+    if [[ -n "${ZSH_VERSION:-}" || "$SHELL" == */zsh ]]; then
+        SHELL_RC="$HOME/.zshrc"
+    else
+        SHELL_RC="$HOME/.bashrc"
+    fi
+    echo '' >> "$SHELL_RC"
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+    ok "Added ~/.local/bin to PATH in $SHELL_RC"
+    warn "Run: source $SHELL_RC  (or open a new terminal)"
+fi
+
+# ── 3. System packages ────────────────────────────────────────────────────────
+
+echo ""
+echo "=== System dependencies ==="
+
+APT_NEEDED=()
+for pkg in curl wget jq parted; do
+    if ! command -v "$pkg" &>/dev/null; then
+        APT_NEEDED+=("$pkg")
+    else
+        ok "$pkg"
+    fi
+done
+
+if ! command -v docker &>/dev/null; then
+    APT_NEEDED+=(docker.io)
+else
+    ok "docker ($(docker --version | awk '{print $3}' | tr -d ','))"
+fi
+
+if ! command -v qemu-system-aarch64 &>/dev/null; then
+    APT_NEEDED+=(qemu-system-arm qemu-utils)
+fi
+
+if [[ ${#APT_NEEDED[@]} -gt 0 ]]; then
+    warn "Installing missing packages: ${APT_NEEDED[*]}"
+    sudo apt-get update -qq
+    sudo apt-get install -y "${APT_NEEDED[@]}"
+    ok "Packages installed"
+fi
+
+# ── 4. QEMU version check (raspi4b needs QEMU 9+) ────────────────────────────
+
+echo ""
+echo "=== QEMU ==="
+
+QEMU_VERSION=$(qemu-system-aarch64 --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+QEMU_MAJOR=$(echo "$QEMU_VERSION" | cut -d. -f1)
+ok "qemu-system-aarch64 $QEMU_VERSION installed"
+
+if [[ "$QEMU_MAJOR" -lt 9 ]]; then
+    warn "QEMU $QEMU_VERSION is too old for raspi4b emulation (requires QEMU 9+)"
+    echo ""
+    info "Option A — try a backports PPA (may have QEMU 9):"
+    info "  sudo add-apt-repository ppa:canonical-server/server-backports"
+    info "  sudo apt update && sudo apt install -y qemu-system-arm"
+    echo ""
+    info "Option B — build QEMU 9 from source:"
+    info "  sudo apt install -y build-essential ninja-build python3-pip libglib2.0-dev libpixman-1-dev"
+    info "  wget https://download.qemu.org/qemu-9.2.0.tar.xz"
+    info "  tar xf qemu-9.2.0.tar.xz && cd qemu-9.2.0"
+    info "  ./configure --target-list=aarch64-softmmu,arm-softmmu --prefix=/usr/local"
+    info "  make -j\$(nproc) && sudo make install"
+    echo ""
+    info "Without QEMU 9+: 'rpi shell' (Docker chroot) still works; 'rpi run' is limited to raspi3b."
+else
+    ok "QEMU $QEMU_VERSION supports raspi4b"
+fi
+
+# ── 5. ARM64 binfmt (needed for 'rpi shell' Docker chroot) ───────────────────
+
+echo ""
+echo "=== ARM64 binfmt (rpi shell) ==="
+
+if grep -q "^enabled" /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
+    ok "qemu-aarch64 binfmt already registered"
+else
+    warn "ARM64 binfmt not registered — registering now via Docker..."
+    if command -v docker &>/dev/null; then
+        docker run --privileged --rm tonistiigi/binfmt --install all \
+            && ok "ARM64 binfmt registered (persists until reboot)" \
+            || warn "binfmt registration failed — 'rpi shell' may not work"
+        info "To re-register after reboot, run:"
+        info "  docker run --privileged --rm tonistiigi/binfmt --install all"
+    else
+        warn "Docker not available — skipping binfmt registration"
+        info "After installing Docker, run:"
+        info "  docker run --privileged --rm tonistiigi/binfmt --install all"
+    fi
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== Setup complete ==="
+ok "Run: rpi help"
+echo ""
