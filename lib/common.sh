@@ -150,12 +150,18 @@ _pick_machine() {
 # QEMU usb-net requires this to appear as usb0 in the guest.
 _pi4b_patch_dtb() {
     local dtb="$1"
+    # Prefer fdtput (device-tree-compiler) — no Python dependency
+    if command -v fdtput &>/dev/null; then
+        fdtput -t s "$dtb" /soc/usb@7e980000 status okay 2>/dev/null && return 0
+    fi
+    # Fallback: python3-fdt
     python3 - "$dtb" <<'PYEOF' 2>/dev/null || return 1
 import sys
 try:
     import fdt
 except ImportError:
-    sys.exit(0)
+    print("  Warning: install device-tree-compiler or python3-fdt to enable USB networking", file=sys.stderr)
+    sys.exit(1)
 with open(sys.argv[1], 'rb') as f:
     dt = fdt.parse_dtb(f.read())
 usb = dt.get_node('/soc/usb@7e980000')

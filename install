@@ -52,7 +52,7 @@ echo ""
 echo "=== System dependencies ==="
 
 APT_NEEDED=()
-for pkg in curl wget jq parted; do
+for pkg in curl wget jq parted device-tree-compiler; do
     if ! command -v "$pkg" &>/dev/null; then
         APT_NEEDED+=("$pkg")
     else
