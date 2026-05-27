@@ -6,6 +6,7 @@ Default/
 *.qcow2
 *.xz
 *.zip
+*.deb
 /tmp/
 
 # Python / build artifacts
