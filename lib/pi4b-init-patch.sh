@@ -343,8 +343,7 @@ fi
 # Set up the target user
 if [ -f "${rootmnt}/etc/passwd" ]; then
     if grep -q "^${RPI_USER}:" "${rootmnt}/etc/passwd"; then
-        # User exists — ensure login shell is bash
-        sed -i "/^${RPI_USER}:/ s|:[^:]*\$|:/bin/bash|" "${rootmnt}/etc/passwd"
+        : # user already exists; shell fixed below
     elif grep -q "^pi:" "${rootmnt}/etc/passwd"; then
         # Rename existing pi user to RPI_USER
         sed -i "s|^pi:|${RPI_USER}:|" "${rootmnt}/etc/passwd"
@@ -355,6 +354,9 @@ if [ -f "${rootmnt}/etc/passwd" ]; then
         echo "${RPI_USER}:x:1000:1000:,,,:/home/${RPI_USER}:/bin/bash" >> "${rootmnt}/etc/passwd"
         echo "${RPI_USER}:x:1000:" >> "${rootmnt}/etc/group" 2>/dev/null || true
     fi
+    # Always fix shell — the pi placeholder in Bookworm/Trixie ships with /usr/sbin/nologin
+    # and the rename branch above inherits it without this unconditional fix.
+    sed -i "/^${RPI_USER}:/ s|:[^:]*\$|:/bin/bash|" "${rootmnt}/etc/passwd"
 fi
 
 # Set password
@@ -396,7 +398,11 @@ fi
 # Mask services not needed in QEMU to speed up boot
 mkdir -p "${rootmnt}/etc/systemd/system"
 # First-boot wizard and cloud provisioning
+# userconf-pi / renameuser process userconf.txt and reject uppercase usernames,
+# breaking accounts set up by this initrd. Mask them — initrd handles user setup.
 ln -sf /dev/null "${rootmnt}/etc/systemd/system/userconfig.service" 2>/dev/null || true
+ln -sf /dev/null "${rootmnt}/etc/systemd/system/userconf-pi.service" 2>/dev/null || true
+ln -sf /dev/null "${rootmnt}/etc/systemd/system/renameuser.service" 2>/dev/null || true
 ln -sf /dev/null "${rootmnt}/etc/systemd/system/cloud-init.service" 2>/dev/null || true
 ln -sf /dev/null "${rootmnt}/etc/systemd/system/cloud-init-main.service" 2>/dev/null || true
 ln -sf /dev/null "${rootmnt}/etc/systemd/system/cloud-init-local.service" 2>/dev/null || true

@@ -49,8 +49,14 @@ cmd_list() {
         pid=$(cat "$pid_file")
         name=$(basename "$pid_file" .pid | sed 's/^rpi-//')
         if kill -0 "$pid" 2>/dev/null; then
+            local _list_user="$DEFAULT_USER"
+            local _lcf="$CONFIGS_DIR/${name}.creds"
+            if [[ -f "$_lcf" ]]; then
+                local _u; _u=$(grep '^USER=' "$_lcf" | cut -d= -f2-)
+                [[ -n "$_u" ]] && _list_user="$_u"
+            fi
             info "$name  (pid $pid)"
-            info "  SSH: ssh -p $SSH_PORT ${DEFAULT_USER}@${lan_ip:-localhost}"
+            info "  SSH: ssh -p $SSH_PORT ${_list_user}@${lan_ip:-localhost}"
             local ports_file="$CONFIGS_DIR/${name}.ports"
             if [[ -f "$ports_file" ]]; then
                 while IFS= read -r _line; do
@@ -248,6 +254,13 @@ cmd_download() {
     local cred_user cred_pass cred_pass2
     read -rp "  Username [pi]: " cred_user
     [[ -z "$cred_user" ]] && cred_user="pi"
+    if [[ "$cred_user" =~ [A-Z] ]]; then
+        local _lower; _lower="${cred_user,,}"
+        echo "  Warning: Raspberry Pi OS rejects usernames with uppercase letters."
+        echo "  Suggested lowercase: $_lower"
+        read -rp "  Use '$_lower' instead? [Y/n]: " _lc_confirm
+        [[ "${_lc_confirm,,}" != "n" ]] && cred_user="$_lower"
+    fi
     while true; do
         read -rsp "  Password [raspberry]: " cred_pass; echo ""
         [[ -z "$cred_pass" ]] && cred_pass="raspberry" && break
@@ -269,9 +282,23 @@ cmd_shell() {
     [[ -f "$img" ]] || img="$IMAGES_DIR/$img"
     [[ -f "$img" ]] || die "Image not found: $img"
 
+    local _slug; _slug=$(slug "$img")
+    local _creds_f="$CONFIGS_DIR/${_slug}.creds"
+    local _cfg_user="" _cfg_pass=""
+    if [[ -f "$_creds_f" ]]; then
+        _cfg_user=$(grep '^USER=' "$_creds_f" | cut -d= -f2-)
+        _cfg_pass=$(grep '^PASS=' "$_creds_f" | cut -d= -f2-)
+    fi
+    [[ -z "$_cfg_user" ]] && _cfg_user="${DEFAULT_USER}"
+
     echo ""
-    read -rp "Shell as user [root]: " shell_user
-    shell_user="${shell_user:-root}"
+    read -rp "Shell as user [${_cfg_user}]: " shell_user
+    shell_user="${shell_user:-${_cfg_user}}"
+
+    # Reject usernames that don't match the configured user for this image
+    if [[ "$shell_user" != "root" && "$shell_user" != "$_cfg_user" ]]; then
+        die "User '$shell_user' is not configured for this image (expected '$_cfg_user'). Use 'root' or leave blank."
+    fi
 
     local name; name=$(_image_display_name "$img")
     echo ""
@@ -283,7 +310,14 @@ cmd_shell() {
     if [[ "$shell_user" == "root" ]]; then
         docker_chroot_run "$img" "1" "bridge"
     else
-        docker_chroot_run "$img" "1" "bridge" su - "$shell_user" -s /bin/bash
+        # The custom user only exists on the qcow2 (created by the Pi 4B initrd at boot).
+        # The raw .img has the original pi placeholder (with nologin) or no user at all.
+        # Create/fix the user inline before su-ing; su from root needs no password.
+        local _setup
+        printf -v _setup \
+            'id "%s" >/dev/null 2>&1 || useradd -m -s /bin/bash "%s"; usermod -s /bin/bash "%s" 2>/dev/null || true; usermod -aG sudo "%s" 2>/dev/null || true; printf "%%s:%%s\n" "%s" "%s" | chpasswd 2>/dev/null || true; exec su - "%s"' \
+            "$shell_user" "$shell_user" "$shell_user" "$shell_user" "$shell_user" "$_cfg_pass" "$shell_user"
+        docker_chroot_run "$img" "1" "bridge" /bin/bash -c "$_setup"
     fi
 }
 
@@ -363,11 +397,14 @@ cmd_run() {
     [[ "$qemu_machine" == "raspi4b" ]] && need_initrd=1
     { [[ -f "$kdir/$kernel_file" ]] && [[ -f "$kdir/$dtb_file" ]] && { [[ $need_initrd -eq 0 ]] || [[ -f "$kdir/initrd" ]]; }; } || rm -rf "$kdir"
 
-    # For Pi 4B: rebuild initrd if credentials changed since last build
-    if [[ "$qemu_machine" == "raspi4b" && -f "$kdir/initrd" && -f "$creds_file" ]]; then
-        if [[ "$creds_file" -nt "$kdir/initrd" ]]; then
-            info "Credentials updated — rebuilding initrd..."
-            _pi4b_build_initrd "$kdir" "$DEFAULT_USER" "$DEFAULT_PASS" && info "Rebuilt Pi 4B initrd with new credentials"
+    # For Pi 4B: rebuild initrd if credentials or the patch script changed since last build
+    if [[ "$qemu_machine" == "raspi4b" && -f "$kdir/initrd" ]]; then
+        local _rebuild_reason=""
+        [[ -f "$creds_file" && "$creds_file" -nt "$kdir/initrd" ]] && _rebuild_reason="credentials updated"
+        [[ "$LIB_DIR/pi4b-init-patch.sh" -nt "$kdir/initrd" ]] && _rebuild_reason="init patch updated"
+        if [[ -n "$_rebuild_reason" ]]; then
+            info "Rebuilding initrd (${_rebuild_reason})..."
+            _pi4b_build_initrd "$kdir" "$DEFAULT_USER" "$DEFAULT_PASS" && info "Rebuilt Pi 4B initrd"
         fi
     fi
 
@@ -850,6 +887,150 @@ cmd_flash() {
     echo ""
 }
 
+# ── cmd: export ───────────────────────────────────────────────────────────────
+
+cmd_export() {
+    local disks=()
+    for f in "$DISKS_DIR"/*.qcow2; do
+        [[ -f "$f" ]] && disks+=("$f")
+    done
+
+    [[ ${#disks[@]} -eq 0 ]] && die "No qcow2 disks found in $DISKS_DIR. Run an image first."
+
+    echo ""
+    echo "=== Export qcow2 → .img ==="
+    echo ""
+    echo "Select disk to export:"
+    local i=1
+    for d in "${disks[@]}"; do
+        local sz; sz=$(du -sh "$d" 2>/dev/null | cut -f1)
+        printf "  [%d] %-40s [%s]\n" "$i" "$(basename "$d")" "$sz"
+        ((i++))
+    done
+    echo ""
+    read -rp "Disk [1-$((i-1))]: " sel
+    [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le $((i-1)) ]] || die "Invalid selection"
+
+    local src="${disks[$((sel-1))]}"
+    local default_name; default_name="$(basename "${src%.qcow2}").img"
+    local default_out="$IMAGES_DIR/$default_name"
+
+    echo ""
+    read -rp "Output path [$default_out]: " out_path
+    [[ -z "$out_path" ]] && out_path="$default_out"
+
+    # If user gave a directory, append the default filename
+    [[ -d "$out_path" ]] && out_path="${out_path%/}/$default_name"
+
+    if [[ -f "$out_path" ]]; then
+        read -rp "  '$out_path' already exists. Overwrite? [y/N]: " ow
+        [[ "${ow,,}" == "y" ]] || { echo "Aborted."; return 1; }
+    fi
+
+    # Check if the qcow2 is locked by a running QEMU instance
+    local slug; slug=$(basename "${src%.qcow2}")
+    local pid_file="/tmp/rpi-${slug}.pid"
+    local unsafe_flag=""
+    if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        echo ""
+        echo "  ⚠  VM '$slug' is currently running and holds a write lock on the disk."
+        echo "     [1] Stop the VM, then export (safe — filesystem will be consistent)"
+        echo "     [2] Export while running (fast, but image may be inconsistent)"
+        echo "     [q] Cancel"
+        echo ""
+        read -rp "  Choice: " lock_choice
+        case "${lock_choice,,}" in
+            1)
+                local pid; pid=$(cat "$pid_file")
+                kill "$pid" 2>/dev/null && info "Stopped VM (pid $pid)"
+                rm -f "$pid_file"
+                ;;
+            2)
+                unsafe_flag="-U"
+                echo ""
+                echo "  Proceeding with live export. Shut down the guest OS cleanly first"
+                echo "  (rpi ssh → sudo shutdown -h now) for a consistent filesystem."
+                ;;
+            *) echo "Aborted."; return 1 ;;
+        esac
+    fi
+
+    echo ""
+    echo "Converting (this may take a minute for large disks)..."
+    # shellcheck disable=SC2086
+    qemu_img convert $unsafe_flag -f qcow2 -O raw "$src" "$out_path"
+
+    local sz; sz=$(du -sh "$out_path" | cut -f1)
+    echo ""
+    info "Exported: $out_path ($sz)"
+}
+
+# ── cmd: shrink ───────────────────────────────────────────────────────────────
+
+cmd_shrink() {
+    local pishrink="/usr/local/bin/pishrink.sh"
+    if [[ ! -x "$pishrink" ]]; then
+        echo ""
+        echo "pishrink.sh is not installed."
+        read -rp "  Install it now to /usr/local/bin/pishrink.sh? [Y/n]: " inst
+        [[ "${inst,,}" == "n" ]] && { echo "Aborted."; return 1; }
+        echo "Downloading pishrink.sh..."
+        sudo curl -fsSL \
+            "https://raw.githubusercontent.com/Drewsif/PiShrink/master/pishrink.sh" \
+            -o "$pishrink" || die "Download failed"
+        sudo chmod +x "$pishrink"
+        info "Installed: $pishrink"
+    fi
+
+    local images=()
+    for f in "$IMAGES_DIR"/*.img; do
+        [[ -f "$f" ]] && images+=("$f")
+    done
+    [[ ${#images[@]} -eq 0 ]] && die "No .img files found in $IMAGES_DIR"
+
+    echo ""
+    echo "=== Shrink Image (pishrink) ==="
+    echo ""
+    echo "Select image to shrink:"
+    local i=1
+    for f in "${images[@]}"; do
+        local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1)
+        printf "  [%d] %-50s [%s]\n" "$i" "$(_image_display_name "$f")" "$sz"
+        ((i++))
+    done
+    printf "  [%d] Enter custom path...\n" "$i"
+    echo ""
+    read -rp "Image [1-$i]: " sel
+
+    local img
+    if [[ "$sel" == "$i" ]]; then
+        read -rp "  Path to .img file: " custom_path
+        custom_path="${custom_path/#\~/$HOME}"
+        [[ -f "$custom_path" ]] || die "File not found: $custom_path"
+        img="$custom_path"
+    else
+        [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le $((i-1)) ]] || die "Invalid selection"
+        img="${images[$((sel-1))]}"
+    fi
+    local before; before=$(du -sh "$img" | cut -f1)
+
+    echo ""
+    echo "pishrink will:"
+    echo "  • Shrink the root filesystem to its minimum size"
+    echo "  • Truncate the image file to match"
+    echo "  • Inject auto-expand so the Pi fills the SD card on first boot"
+    echo ""
+    read -rp "Shrink '$(_image_display_name "$img")' in-place? [Y/n]: " confirm
+    [[ "${confirm,,}" == "n" ]] && { echo "Aborted."; return 1; }
+
+    echo ""
+    sudo "$pishrink" "$img"
+
+    local after; after=$(du -sh "$img" | cut -f1)
+    echo ""
+    info "Done: $before → $after"
+}
+
 # ── cmd: imager ───────────────────────────────────────────────────────────────
 
 cmd_imager() {
@@ -882,18 +1063,25 @@ cmd_exec() {
 # ── cmd: ssh (non-interactive or interactive QEMU SSH) ────────────────────────
 
 cmd_ssh() {
-    local running_pid=""
+    local running_pid="" running_name=""
     for pf in /tmp/rpi-*.pid; do
         [[ -e "$pf" ]] || continue
         local p; p=$(cat "$pf")
         if kill -0 "$p" 2>/dev/null; then
             running_pid="$p"
+            running_name=$(basename "$pf" .pid | sed 's/^rpi-//')
             break
         else
             rm -f "$pf"
         fi
     done
     [[ -n "$running_pid" ]] || die "No running QEMU instance. Start one with: rpi run"
+
+    local creds_file="$CONFIGS_DIR/${running_name}.creds"
+    if [[ -f "$creds_file" ]]; then
+        local _u; _u=$(grep '^USER=' "$creds_file" | cut -d= -f2-)
+        [[ -n "$_u" ]] && DEFAULT_USER="$_u"
+    fi
 
     ssh -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
@@ -1211,6 +1399,8 @@ cmd_help() {
                                         -v / --verbose  show serial output during boot
     rpi delete [image]                Delete an image and all associated data
     rpi ssh    [cmd...]               SSH to running QEMU VM (interactive or not)
+    rpi export                        Convert a qcow2 disk back to a plain .img file
+    rpi shrink [image]                Shrink a .img to minimum size (auto-expands on Pi boot)
     rpi flash  [image]                Flash image (or qcow2) to an SD card
     rpi stop   [name]                 Stop a running QEMU instance
     rpi imager                        Launch rpi-imager GUI
@@ -1276,6 +1466,8 @@ cmd_menu() {
         echo "║  [m] Change emulation target     ║"
         echo "║  [9] SSH to running VM           ║"
         echo "║  [0] Flash image to SD card      ║"
+        echo "║  [e] Export qcow2 → .img         ║"
+        echo "║  [k] Shrink image (pishrink)     ║"
         echo "║  [s] Stop a running instance     ║"
         echo "║  [z] Resize image                ║"
         echo "║  [p] Port forwards               ║"
@@ -1299,6 +1491,8 @@ cmd_menu() {
             m) cmd_machine ;;
             9) cmd_ssh ;;
             0) cmd_flash ;;
+            e) cmd_export ;;
+            k) cmd_shrink ;;
             s) cmd_stop ;;
             z) cmd_resize ;;
             p) cmd_ports ;;
@@ -1325,6 +1519,8 @@ case "${1:-menu}" in
     ssh)      shift; cmd_ssh "$@" ;;
     put)      shift; cmd_put "$@" ;;
     get)      shift; cmd_get "$@" ;;
+    export)   cmd_export ;;
+    shrink)   cmd_shrink "${2:-}" ;;
     flash)    cmd_flash ;;
     resize)   cmd_resize "${2:-}" ;;
     ports)    cmd_ports "${2:-}" ;;

@@ -7,3 +7,12 @@ Default/
 *.xz
 *.zip
 /tmp/
+
+# Python / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+ros2_ws/fairino_sdk/build/
+ros2_ws/install/
+ros2_ws/build/
+ros2_ws/log/
