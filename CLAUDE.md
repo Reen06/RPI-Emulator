@@ -78,7 +78,7 @@ Pi 4B is the only model with custom initramfs handling. On first `rpi run` for a
 
 The `ros-farino` image (Pi 4B, user `robotics`, pass `farino`) is the active project image. It hosts a ROS2 Jazzy workspace for controlling a Farino FR-3 robot arm connected over Ethernet (robot at **192.168.57.2** — reconciled from the live Pi 2026-06-24; originally documented as 192.168.58.2 on a direct cable).
 
-> **Live-Pi reconciliation (2026-06-24):** The flashed Pi required on-Pi tweaks to get robot communication working, now folded back into this repo. Key fix in `farino_client.py:connect()`: the Fairino SDK's `is_connect` flag stays False on this firmware (XML-RPC on port 20004 vs 20005/CNDE), so a direct XML-RPC probe on port 20003 + forcing `RPC.is_connect = True` is required before any command. Robot IP moved to 192.168.57.2. Pi networking is dual-homed/in-flux (see `setup/02_configure_network.sh` note). Remote access to the live Pi is via the Sand-OS travel-router SSH bridge: `ssh robot-pi`.
+> **Live-Pi reconciliation (2026-06-24):** The flashed Pi required on-Pi tweaks to get robot communication working, now folded back into this repo. Key fix in `farino_client.py:connect()`: the Fairino SDK's `is_connect` flag stays False on this firmware (XML-RPC on port 20004 vs 20005/CNDE), so a direct XML-RPC probe on port 20003 + forcing `RPC.is_connect = True` is required before any command. Robot IP moved to 192.168.57.2. Pi networking is dual-homed/in-flux (see `setup/02_configure_network.sh` note). Remote access to the live Pi is a two-hop SSH bridge — documented separately in `docs/remote-access.md`.
 
 **Provisioning** (runs once, uses Docker chroot — no QEMU needed):
 ```bash
