@@ -6,7 +6,8 @@ Installed at: `/home/robotics/plans/architecture.md`
 
 ```
 Raspberry Pi 4B  (this device)
-  eth0 → 192.168.58.100/24
+  eth0 → 192.168.57.100 (DHCP, upstream LAN) + 192.168.58.100/24 (static)
+         robot now reached on the .57 subnet — see reconciliation note below
 
   ~/ros2_ws/src/farino_wave/
     wave_node.py        ← main node (auto-starts via systemd)
@@ -18,9 +19,11 @@ Raspberry Pi 4B  (this device)
   systemd: farino-wave.service
 
   ─── Ethernet cable ──────────────────────────────────
-  FR-3 Control Box   192.168.58.2   TCP port 8083 (status)
-                                    SDK command port (handled by SDK)
+  FR-3 Control Box   192.168.57.2   TCP port 20003 (XML-RPC command)
 ```
+
+> **Reconciled from the live robot Pi on 2026-06-24.** Communication required
+> on-Pi tweaks not present in the original push. See "Robot Connection" below.
 
 ## ROS2 Interface
 
@@ -31,15 +34,26 @@ Raspberry Pi 4B  (this device)
 
 ## Robot Connection
 
-The Farino FR-3 uses the **Fairino Python SDK** (`Robot.RPC('192.168.58.2')`).
+The Farino FR-3 uses the **Fairino Python SDK** (`Robot.RPC('192.168.57.2')`).
+The SDK is pure Python (xmlrpc + ctypes), so no arm64 binaries are needed.
 
-The SDK connects to the robot's control box over Ethernet. Port 8083 is the
-real-time status feedback port (100 ms interval); the command port is handled
-by the SDK internally.
+**Communication fix (reconciled from the live Pi, 2026-06-24):** the SDK's
+internal `is_connect` flag stayed `False` on this robot's firmware — older
+firmware exposes XML-RPC on port **20004** instead of **20005** (CNDE). Because
+the SDK's `@xmlrpc_timeout` decorator gates *every* call on `is_connect`, all
+commands silently failed. `farino_client.connect()` now:
 
-**If libfairino.so is not arm64-compatible**, the node logs a warning and runs
-in dry-run mode (motion commands are logged, not executed). Request arm64
-binaries from Fairino support or compile from source.
+1. Creates `_FairinoRPC.RPC(ip)` as usual.
+2. Directly probes XML-RPC on **port 20003** (`ServerProxy(...).GetControllerIP()`,
+   3 s socket timeout).
+3. On success, **forces `_FairinoRPC.RPC.is_connect = True`** so the decorator
+   lets commands through; on failure logs `XML-RPC probe failed` and returns False.
+
+`is_estop_or_collision()` was also hardened to tolerate a non-tuple return from
+`GetRobotErrorCode()` when the RPC link is not fully up.
+
+If the SDK import fails or `FARINO_DRY_RUN=1`, the node logs a warning and runs
+in dry-run mode (motion commands are logged, not executed).
 
 ## Wave Sequence
 

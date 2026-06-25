@@ -36,7 +36,7 @@ class FarinoClient:
     intended action and return immediately so the node lifecycle still works.
     """
 
-    ROBOT_IP = "192.168.58.2"
+    ROBOT_IP = "192.168.57.2"
 
     # Joint positions for the wave sequence (degrees, 6-DOF FR-3).
     # Tune these for your specific robot installation.
@@ -70,10 +70,26 @@ class FarinoClient:
 
     def connect(self, ip: str = ROBOT_IP) -> bool:
         if self._dry_run:
-            self._log(f"[DRY-RUN] Would connect to {ip}:8083")
+            self._log(f"[DRY-RUN] Would connect to {ip}:20003")
             return True
         try:
-            self._robot = _FairinoRPC.RPC(ip)
+            robot = _FairinoRPC.RPC(ip)
+            # Older firmware exposes port 20004 instead of 20005 (CNDE), so
+            # is_connect may be False even when XML-RPC is fully functional.
+            # The @xmlrpc_timeout decorator gates every SDK call on is_connect,
+            # so force it True once we confirm port 20003 is reachable.
+            import xmlrpc.client as _xmlrpc
+            import socket as _socket
+            _socket.setdefaulttimeout(3)
+            try:
+                _xmlrpc.ServerProxy(f"http://{ip}:20003").GetControllerIP()
+                _FairinoRPC.RPC.is_connect = True
+            except Exception as e:
+                self._log(f"XML-RPC probe failed: {e}", error=True)
+                return False
+            finally:
+                _socket.setdefaulttimeout(None)
+            self._robot = robot
             return True
         except Exception as exc:
             self._log(f"Connection failed: {exc}", error=True)
@@ -127,7 +143,10 @@ class FarinoClient:
     def is_estop_or_collision(self) -> bool:
         """Returns True if the robot has a non-zero error (e-stop or collision)."""
         if self._robot:
-            ret, codes = self._robot.GetRobotErrorCode()
+            result = self._robot.GetRobotErrorCode()
+            if not isinstance(result, (list, tuple)):
+                return False  # RPC not connected — treat as unknown, not collision
+            ret, codes = result
             if ret != 0:
                 return False  # RPC call failed — treat as unknown, not collision
             main_code, sub_code = codes
